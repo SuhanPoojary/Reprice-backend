@@ -1,6 +1,9 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 const { query } = require("../db");
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Helper function to generate JWT token
 const generateToken = (user, userType) => {
@@ -108,6 +111,159 @@ exports.login = async (req, res) => {
   }
 };
 
+// Google OAuth Login/Signup
+exports.googleAuth = async (req, res) => {
+  const { userType } = req.body;
+  const idToken = req.body.credential || req.body.token || req.body.idToken;
+
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID) {
+      return res.status(500).json({
+        success: false,
+        message: "Server misconfigured: GOOGLE_CLIENT_ID missing",
+      });
+    }
+
+    if (!idToken || !userType) {
+      return res.status(400).json({
+        success: false,
+        message: "credential (Google ID token) and userType are required",
+      });
+    }
+
+    if (!["customer", "agent"].includes(userType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid user type. Must be "customer" or "agent"',
+      });
+    }
+
+    // Verify the Google token (ID token)
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const email = payload?.email;
+    const name = payload?.name;
+    const googleId = payload?.sub;
+
+    if (!email) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid Google token (missing email)",
+      });
+    }
+
+    const table = userType === "customer" ? "customers" : "agents";
+
+    // Check whether google_id column exists (avoid crashing on schema mismatch)
+    const googleIdCol = await query(
+      "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'google_id' LIMIT 1",
+      [table]
+    );
+    const hasGoogleIdColumn = googleIdCol.rows.length > 0;
+
+    // Find existing user by email
+    const userResult = await query(`SELECT * FROM ${table} WHERE email = $1`, [
+      email,
+    ]);
+
+    let user;
+    if (userResult.rows.length === 0) {
+      // Create new user
+      const displayName = name || "User";
+
+      const insertWithPhone = async (phoneValue) => {
+        if (hasGoogleIdColumn) {
+          return query(
+            `INSERT INTO ${table} (name, phone, email, password_hash, google_id)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, name, phone, email`,
+            [displayName, phoneValue, email, "google_auth", googleId]
+          );
+        }
+
+        return query(
+          `INSERT INTO ${table} (name, phone, email, password_hash)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, name, phone, email`,
+          [displayName, phoneValue, email, "google_auth"]
+        );
+      };
+
+      try {
+        const inserted = await insertWithPhone(null);
+        user = inserted.rows[0];
+      } catch (dbErr) {
+        // If phone is NOT NULL in DB schema, fall back to a synthetic placeholder.
+        const isPhoneNotNullViolation =
+          typeof dbErr?.message === "string" &&
+          dbErr.message.toLowerCase().includes("phone") &&
+          dbErr.message.toLowerCase().includes("null");
+
+        if (!isPhoneNotNullViolation) {
+          throw dbErr;
+        }
+
+        const placeholderPhone = `google-${(googleId || Date.now().toString()).slice(-12)}`;
+        const inserted = await insertWithPhone(placeholderPhone);
+        user = inserted.rows[0];
+      }
+    } else {
+      user = userResult.rows[0];
+
+      // Best-effort: store google_id for existing users if the column exists.
+      if (hasGoogleIdColumn && googleId && !user.google_id) {
+        try {
+          await query(`UPDATE ${table} SET google_id = $1 WHERE id = $2`, [
+            googleId,
+            user.id,
+          ]);
+        } catch {
+          // Ignore; login should still succeed.
+        }
+      }
+    }
+
+    const jwtToken = generateToken(user, userType);
+    return res.json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          name: user.name,
+          phone: user.phone,
+          email: user.email,
+          userType,
+        },
+        token: jwtToken,
+      },
+    });
+  } catch (err) {
+    // Token verification issues should be 401; DB issues should be 500.
+    const isGoogleTokenError =
+      typeof err?.message === "string" &&
+      (err.message.includes("Wrong recipient") ||
+        err.message.includes("audience") ||
+        err.message.toLowerCase().includes("invalid") ||
+        err.message.toLowerCase().includes("token"));
+
+    const status = err?.code ? 500 : isGoogleTokenError ? 401 : 500;
+
+    console.error("Google auth error:", err);
+    return res.status(status).json({
+      success: false,
+      message:
+        status === 401
+          ? "Invalid Google token"
+          : "Server error during Google login",
+      error: err?.message,
+    });
+  }
+};
+
 exports.getCurrentUser = async (req, res) => {
   const { id, userType } = req.user;
   const table = userType === "customer" ? "customers" : "agents";
@@ -123,6 +279,8 @@ exports.getCurrentUser = async (req, res) => {
   });
 };
 
+
 exports.logout = async (req, res) => {
   res.json({ success: true });
 };
+
