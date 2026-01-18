@@ -4,10 +4,12 @@ const router = express.Router();
 const authRoutes = require("./authRoutes");
 const orderRoutes = require("./orderRoutes");
 const agentRoutes = require("./agentRoutes");
+const partnerRoutes = require("./partnerRoutes");
 
 router.use("/auth", authRoutes);
 router.use("/orders", orderRoutes);
 router.use("/agent", agentRoutes);
+router.use("/partner", partnerRoutes);
 
 // Health check
 router.get("/health", (req, res) => {

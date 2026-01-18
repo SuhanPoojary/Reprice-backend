@@ -25,14 +25,14 @@ exports.signup = async (req, res) => {
       });
     }
 
-    if (!["customer", "agent"].includes(userType)) {
+    if (!["customer", "agent", "partner"].includes(userType)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid user type. Must be "customer" or "agent"',
+        message: 'Invalid user type. Must be "customer", "agent" or "partner"',
       });
     }
 
-    const table = userType === "customer" ? "customers" : "agents";
+    const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
     const existingUser = await query(
       `SELECT id FROM ${table} WHERE phone = $1`,
@@ -72,7 +72,14 @@ exports.login = async (req, res) => {
   const { phone, password, userType } = req.body;
 
   try {
-    const table = userType === "customer" ? "customers" : "agents";
+    if (!["customer", "agent", "partner"].includes(userType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid user type. Must be "customer", "agent" or "partner"',
+      });
+    }
+
+    const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
     const result = await query(
       `SELECT * FROM ${table} WHERE phone = $1`,
@@ -131,10 +138,10 @@ exports.googleAuth = async (req, res) => {
       });
     }
 
-    if (!["customer", "agent"].includes(userType)) {
+    if (!["customer", "agent", "partner"].includes(userType)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid user type. Must be "customer" or "agent"',
+        message: 'Invalid user type. Must be "customer", "agent" or "partner"',
       });
     }
 
@@ -156,7 +163,7 @@ exports.googleAuth = async (req, res) => {
       });
     }
 
-    const table = userType === "customer" ? "customers" : "agents";
+    const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
     // Check whether google_id column exists (avoid crashing on schema mismatch)
     const googleIdCol = await query(
@@ -266,7 +273,7 @@ exports.googleAuth = async (req, res) => {
 
 exports.getCurrentUser = async (req, res) => {
   const { id, userType } = req.user;
-  const table = userType === "customer" ? "customers" : "agents";
+  const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
   const result = await query(
     `SELECT id, name, phone, email FROM ${table} WHERE id = $1`,

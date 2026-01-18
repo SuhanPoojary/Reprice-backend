@@ -4,6 +4,29 @@ const router = express.Router();
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
 
+const _columnCache = new Map();
+
+async function hasColumn(tableName, columnName) {
+  const key = `${tableName}.${columnName}`;
+  if (_columnCache.has(key)) return _columnCache.get(key);
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = $1
+      AND column_name = $2
+    LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  const exists = result.rows.length > 0;
+  _columnCache.set(key, exists);
+  return exists;
+}
+
 /**
  * GET NEARBY ORDERS (within 20 km)
  */
@@ -27,7 +50,7 @@ router.get("/nearby-orders", authenticateToken, async (req, res) => {
     const { latitude, longitude } = agentResult.rows[0];
 
     // 2️⃣ Validate location
-    if (!latitude || !longitude) {
+    if (latitude == null || longitude == null) {
       return res.status(400).json({
         success: false,
         message: "Agent location not set",
@@ -92,6 +115,8 @@ router.get("/nearby-orders", authenticateToken, async (req, res) => {
     INNER JOIN customer_addresses ca ON o.address_id = ca.id
     WHERE o.status = 'pending'
       AND o.agent_id IS NULL
+      AND ca.latitude IS NOT NULL
+      AND ca.longitude IS NOT NULL
   ) AS sub
   WHERE sub.distance_km <= 20
   ORDER BY sub.distance_km ASC
@@ -163,26 +188,39 @@ router.get("/my-pickups", authenticateToken, async (req, res) => {
 
 
 router.post("/update-location", authenticateToken, async (req, res) => {
-  const { latitude, longitude } = req.body;
+  try {
+    const { latitude, longitude } = req.body;
 
-  // 1️⃣ Validate input
-  if (!latitude || !longitude) {
-    return res.status(400).json({
+    // 1️⃣ Validate input (allow 0)
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({
+        success: false,
+        message: "Latitude and longitude are required",
+      });
+    }
+
+    const hasLastSeen = await hasColumn('agents', 'last_seen_at');
+    const sql = hasLastSeen
+      ? 'UPDATE agents SET latitude=$1, longitude=$2, last_seen_at = NOW() WHERE id=$3'
+      : 'UPDATE agents SET latitude=$1, longitude=$2 WHERE id=$3';
+
+    await pool.query(sql, [latitude, longitude, req.user.id]);
+
+    res.json({
+      success: true,
+      message: "Location updated successfully",
+    });
+  } catch (err) {
+    console.error('UPDATE LOCATION ERROR:', err);
+    const details = String(err?.message ?? err);
+    res.status(500).json({
       success: false,
-      message: "Latitude and longitude are required",
+      message:
+        process.env.NODE_ENV !== 'production'
+          ? `Failed to update location: ${details}`
+          : 'Failed to update location',
     });
   }
-
-  // 2️⃣ Update agent location
-  await pool.query(
-    "UPDATE agents SET latitude=$1, longitude=$2 WHERE id=$3",
-    [latitude, longitude, req.user.id]
-  );
-
-  res.json({
-    success: true,
-    message: "Location updated successfully",
-  });
 });
 
 router.get("/my-orders", authenticateToken, async (req, res) => {

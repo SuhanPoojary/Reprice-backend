@@ -66,6 +66,19 @@ exports.isAgent = (req, res, next) => {
   }
 };
 
+// @desc    Check if user is a partner
+// @usage   Add after authenticateToken middleware
+exports.isPartner = (req, res, next) => {
+  if (req.user && req.user.userType === 'partner') {
+    next();
+  } else {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied. Partners only.'
+    });
+  }
+};
+
 // @desc    Validate request body fields
 // @usage   validateFields(['name', 'email', 'phone'])
 exports.validateFields = (requiredFields) => {
