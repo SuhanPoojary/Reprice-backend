@@ -3,6 +3,7 @@ const router = express.Router();
 
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
+const { noteAgentRejected } = require("../memory/orderMemory");
 
 router.post("/create", authenticateToken, async (req, res) => {
   try {
@@ -106,6 +107,128 @@ router.patch("/:id/assign", authenticateToken, async (req, res) => {
   }
 });
 
+// START PICKUP (for orders already assigned to agent but still pending)
+router.patch("/:id/start", authenticateToken, async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const agentId = req.user.id;
+
+    const result = await pool.query(
+      `
+      UPDATE orders
+      SET status = 'in-progress'
+      WHERE id = $1
+        AND agent_id = $2
+        AND status = 'pending'
+      RETURNING *
+      `,
+      [orderId, agentId]
+    );
+
+    if (result.rows.length === 0) {
+      const check = await pool.query(
+        "SELECT id, status, agent_id FROM orders WHERE id = $1",
+        [orderId]
+      );
+      if (check.rows.length === 0) {
+        return res.status(404).json({ success: false, message: "Order not found" });
+      }
+      const row = check.rows[0];
+      if (!row.agent_id) {
+        return res.status(409).json({
+          success: false,
+          message: "Order is not assigned to any agent",
+        });
+      }
+      if (String(row.agent_id) !== String(agentId)) {
+        return res.status(409).json({
+          success: false,
+          message: "Order is assigned to another agent",
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        message: `Order cannot be started from status '${row.status}'`,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Pickup started",
+      order: result.rows[0],
+    });
+  } catch (err) {
+    console.error("START ORDER ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to start pickup",
+    });
+  }
+});
+
+// DECLINE ORDER (unassign a pending order that is currently assigned to this agent)
+router.patch("/:id/decline", authenticateToken, async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const agentId = req.user.id;
+
+    const result = await pool.query(
+      `
+      UPDATE orders
+      SET status = 'pending',
+          agent_id = NULL
+      WHERE id = $1
+        AND agent_id = $2
+        AND status = 'pending'
+      RETURNING *
+      `,
+      [orderId, agentId]
+    );
+
+    if (result.rows.length === 0) {
+      const check = await pool.query(
+        "SELECT id, status, agent_id FROM orders WHERE id = $1",
+        [orderId]
+      );
+      if (check.rows.length === 0) {
+        return res.status(404).json({ success: false, message: "Order not found" });
+      }
+      const row = check.rows[0];
+      if (!row.agent_id) {
+        return res.status(409).json({
+          success: false,
+          message: "Order is already unassigned",
+        });
+      }
+      if (String(row.agent_id) !== String(agentId)) {
+        return res.status(409).json({
+          success: false,
+          message: "Order is assigned to another agent",
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        message: `Order cannot be declined from status '${row.status}'`,
+      });
+    }
+
+    // Track rejected agent for this order (in-memory; no DB changes)
+    noteAgentRejected(orderId, agentId);
+
+    res.json({
+      success: true,
+      message: "Order declined",
+      order: result.rows[0],
+    });
+  } catch (err) {
+    console.error("DECLINE ORDER ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to decline order",
+    });
+  }
+});
+
 // COMPLETE ORDER
 router.patch("/:id/complete", authenticateToken, async (req, res) => {
   try {
@@ -169,6 +292,9 @@ router.patch("/:id/cancel", authenticateToken, async (req, res) => {
         message: "Order cannot be cancelled",
       });
     }
+
+    // Treat cancel as a rejection for future assignment attempts
+    noteAgentRejected(orderId, agentId);
 
     res.json({
       success: true,
