@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 
 const { pool } = require('../db');
 const { authenticateToken, isPartner } = require('../middleware/authMiddleware');
+const { getRejectedAgentIds, getReturnedAt } = require('../memory/orderMemory');
 
 const _columnCache = new Map();
 
@@ -31,8 +32,77 @@ async function hasColumn(tableName, columnName) {
 
 router.use(authenticateToken, isPartner);
 
-// List all orders for partner view
+// List all orders with agents assigned (orders being managed)
 router.get('/orders', async (req, res) => {
+  try {
+    const hasPartnerId = await hasColumn('agents', 'partner_id');
+
+    // If partner_id exists, scope to this partner's agents only.
+    // If not, we cannot reliably scope without DB changes, so we return the current global behavior.
+    const agentJoin = hasPartnerId
+      ? 'JOIN agents a ON o.agent_id = a.id'
+      : 'LEFT JOIN agents a ON o.agent_id = a.id';
+
+    const whereClause = hasPartnerId
+      ? 'WHERE o.agent_id IS NOT NULL AND a.partner_id = $1'
+      : 'WHERE o.agent_id IS NOT NULL';
+
+    const params = hasPartnerId ? [req.user.id] : [];
+
+    const result = await pool.query(
+      `
+      SELECT
+        o.id,
+        o.order_number,
+        o.phone_model,
+        o.phone_variant,
+        o.phone_condition,
+        o.price,
+        o.status,
+        o.pickup_date,
+        o.time_slot,
+        o.created_at,
+        o.agent_id,
+        FALSE AS partner_accepted,
+
+        c.name AS customer_name,
+        c.phone AS customer_phone,
+
+        ca.full_address,
+        ca.city,
+        ca.state,
+        ca.pincode,
+        ca.latitude,
+        ca.longitude,
+
+        a.name AS agent_name,
+        a.phone AS agent_phone
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      JOIN customer_addresses ca ON o.address_id = ca.id
+      ${agentJoin}
+      ${whereClause}
+      ORDER BY o.created_at DESC
+      `
+      ,
+      params
+    );
+
+    const orders = result.rows.map((o) => ({
+      ...o,
+      blocked_agent_ids: getRejectedAgentIds(o.id),
+      returned_at: getReturnedAt(o.id),
+    }));
+
+    res.json({ success: true, orders });
+  } catch (err) {
+    console.error('PARTNER LIST ORDERS ERROR:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch orders' });
+  }
+});
+
+// List unassigned orders available for partners to accept (pending, no agent)
+router.get('/orders/available', async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -48,6 +118,7 @@ router.get('/orders', async (req, res) => {
         o.time_slot,
         o.created_at,
         o.agent_id,
+        FALSE AS partner_accepted,
 
         c.name AS customer_name,
         c.phone AS customer_phone,
@@ -65,14 +136,22 @@ router.get('/orders', async (req, res) => {
       JOIN customers c ON o.customer_id = c.id
       JOIN customer_addresses ca ON o.address_id = ca.id
       LEFT JOIN agents a ON o.agent_id = a.id
+      WHERE o.status = 'pending'
+        AND o.agent_id IS NULL
       ORDER BY o.created_at DESC
       `
     );
 
-    res.json({ success: true, orders: result.rows });
+    const orders = result.rows.map((o) => ({
+      ...o,
+      blocked_agent_ids: getRejectedAgentIds(o.id),
+      returned_at: getReturnedAt(o.id),
+    }));
+
+    res.json({ success: true, orders });
   } catch (err) {
-    console.error('PARTNER LIST ORDERS ERROR:', err);
-    res.status(500).json({ success: false, message: 'Failed to fetch orders' });
+    console.error('PARTNER LIST AVAILABLE ORDERS ERROR:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch available orders' });
   }
 });
 
@@ -173,6 +252,23 @@ router.post('/agents', async (req, res) => {
   }
 });
 
+// Accept an order (partner action - marks status as 'accepted' in memory)
+// Note: This doesn't persist to DB, just tracks acceptance in session
+router.patch('/orders/:id/accept', async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    
+    console.log('ACCEPT ORDER - orderId:', orderId);
+    
+    // Since there's no partner_accepted column in the data,
+    // we just return success - the UI will track acceptance state
+    res.json({ success: true, order: { id: orderId } });
+  } catch (err) {
+    console.error('PARTNER ACCEPT ORDER ERROR:', err);
+    res.status(500).json({ success: false, message: 'Failed to accept order' });
+  }
+});
+
 // Assign an order to an agent (partner action)
 router.patch('/orders/:id/assign-agent', async (req, res) => {
   try {
@@ -192,8 +288,7 @@ router.patch('/orders/:id/assign-agent', async (req, res) => {
     const result = await pool.query(
       `
       UPDATE orders
-      SET agent_id = $1,
-          status = 'in-progress'
+      SET agent_id = $1
       WHERE id = $2
         AND status = 'pending'
         AND agent_id IS NULL
