@@ -4,6 +4,7 @@ const router = express.Router();
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { noteAgentRejected } = require("../memory/orderMemory");
+const creditService = require("../services/creditService");
 
 router.post("/create", authenticateToken, async (req, res) => {
   try {
@@ -41,11 +42,22 @@ router.post("/create", authenticateToken, async (req, res) => {
 
     const orderNumber = `MOB${Date.now()}${Math.floor(Math.random() * 1000)}`;
 
+    // Credits policy (stored per-order):
+    // Example target: price ₹40,000 => 4,000 credits required => 20% discount.
+    // We persist values so partners see a stable credit requirement.
+    await creditService.ensureCreditSchema();
+    const orderPrice = Number(phone?.price ?? 0);
+    const requiredCredits = orderPrice > 0 ? Math.ceil(orderPrice / 10) : 0;
+    const discountPerCredit =
+      requiredCredits > 0 ? (0.2 * orderPrice) / requiredCredits : 0;
+    const maxDiscountRupees = orderPrice > 0 ? 0.2 * orderPrice : 0;
+
     const orderResult = await pool.query(
       `INSERT INTO orders
        (customer_id, address_id, phone_model, phone_variant, phone_condition,
-        price, pickup_date, payment_method, time_slot, order_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        price, pickup_date, payment_method, time_slot, order_number,
+        required_credits, discount_rupees_per_credit, max_discount_rupees)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         customerId,
@@ -58,6 +70,9 @@ router.post("/create", authenticateToken, async (req, res) => {
         paymentMethod,
         timeSlot,
         orderNumber,
+        requiredCredits,
+        discountPerCredit,
+        maxDiscountRupees,
       ]
     );
 

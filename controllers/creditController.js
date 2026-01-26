@@ -176,7 +176,7 @@ exports.listProductCosts = async (req, res) => {
 };
 
 exports.upsertProductCost = async (req, res) => {
-  const { product_key, credits_per_order, is_active } = req.body ?? {};
+  const { product_key, credits_per_order, credits_per_1000_rupees, discount_rupees_per_credit, max_discount_rupees, is_active } = req.body ?? {};
   try {
     if (!product_key || credits_per_order == null) {
       return res.status(400).json({ success: false, message: "product_key and credits_per_order are required" });
@@ -186,9 +186,24 @@ exports.upsertProductCost = async (req, res) => {
       return res.status(400).json({ success: false, message: "credits_per_order cannot be negative" });
     }
 
+    if (discount_rupees_per_credit != null && Number(discount_rupees_per_credit) < 0) {
+      return res.status(400).json({ success: false, message: "discount_rupees_per_credit cannot be negative" });
+    }
+
+    if (max_discount_rupees != null && Number(max_discount_rupees) < 0) {
+      return res.status(400).json({ success: false, message: "max_discount_rupees cannot be negative" });
+    }
+
+    if (credits_per_1000_rupees != null && Number(credits_per_1000_rupees) < 0) {
+      return res.status(400).json({ success: false, message: "credits_per_1000_rupees cannot be negative" });
+    }
+
     const row = await creditService.upsertProductCost({
       productKey: product_key,
       creditsPerOrder: credits_per_order,
+      creditsPer1000Rupees: credits_per_1000_rupees ?? 0,
+      discountRupeesPerCredit: discount_rupees_per_credit ?? 0,
+      maxDiscountRupees: max_discount_rupees ?? 0,
       isActive: is_active !== false,
     });
 

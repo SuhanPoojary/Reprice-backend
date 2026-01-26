@@ -14,6 +14,47 @@ const generateToken = (user, userType) => {
   );
 };
 
+function getPartnerApplicationFields(body) {
+  const src = body ?? {};
+
+  const companyName = src.company_name ?? src.companyName;
+  const businessAddress = src.business_address ?? src.businessAddress;
+  const gstNumber = src.gst_number ?? src.gstNumber;
+  const panNumber = src.pan_number ?? src.panNumber;
+  const messageFromPartner = src.message_from_partner ?? src.messageFromPartner;
+
+  return {
+    company_name: companyName ? String(companyName).trim() : null,
+    business_address: businessAddress ? String(businessAddress).trim() : null,
+    gst_number: gstNumber ? String(gstNumber).trim() : null,
+    pan_number: panNumber ? String(panNumber).trim() : null,
+    message_from_partner: messageFromPartner ? String(messageFromPartner).trim() : null,
+  };
+}
+
+function shapeUserForResponse(userType, row) {
+  const base = {
+    id: row.id,
+    name: row.name,
+    phone: row.phone,
+    email: row.email,
+    userType,
+  };
+
+  if (userType !== "partner") return base;
+
+  return {
+    ...base,
+    company_name: row.company_name ?? null,
+    business_address: row.business_address ?? null,
+    gst_number: row.gst_number ?? null,
+    pan_number: row.pan_number ?? null,
+    verification_status: row.verification_status ?? null,
+    is_active: row.is_active ?? null,
+    rejection_reason: row.rejection_reason ?? null,
+  };
+}
+
 exports.signup = async (req, res) => {
   const { name, phone, email, password, userType } = req.body;
 
@@ -22,6 +63,13 @@ exports.signup = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Name, phone, password, and user type are required",
+      });
+    }
+
+    if (userType === "partner" && !String(email || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Email is required for partner applications",
       });
     }
 
@@ -48,19 +96,75 @@ exports.signup = async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const result = await query(
-      `INSERT INTO ${table} (name, phone, email, password_hash)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, name, phone, email`,
-      [name, phone, email || null, passwordHash]
-    );
+    const partnerFields = userType === "partner" ? getPartnerApplicationFields(req.body) : null;
+
+    const result =
+      userType === "partner"
+        ? await query(
+            `INSERT INTO ${table} (
+              name,
+              phone,
+              email,
+              password_hash,
+              company_name,
+              business_address,
+              gst_number,
+              pan_number,
+              verification_status,
+              is_active
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',false)
+            RETURNING id, name, phone, email, company_name, business_address, gst_number, pan_number, verification_status, is_active, rejection_reason`,
+            [
+              name,
+              phone,
+              email || null,
+              passwordHash,
+              partnerFields.company_name,
+              partnerFields.business_address,
+              partnerFields.gst_number,
+              partnerFields.pan_number,
+            ]
+          )
+        : await query(
+            `INSERT INTO ${table} (name, phone, email, password_hash)
+             VALUES ($1,$2,$3,$4)
+             RETURNING id, name, phone, email`,
+            [name, phone, email || null, passwordHash]
+          );
 
     const user = result.rows[0];
+
+    if (userType === "partner") {
+      // Best-effort: record application submission event for admin timeline.
+      try {
+        const message = partnerFields?.message_from_partner || "Application submitted";
+        await query(
+          `INSERT INTO partner_verification_history (partner_id, action_type, message_from_partner)
+           VALUES ($1, 'submitted', $2)`,
+          [String(user.id), message]
+        );
+      } catch {
+        // ignore
+      }
+
+      // Partner signup is an application submission (no login until admin approves).
+      return res.status(201).json({
+        success: true,
+        message:
+          "Application submitted. Admin will review and contact you via email if approved.",
+        data: {
+          application_submitted: true,
+          partner_id: String(user.id),
+        },
+      });
+    }
+
     const token = generateToken(user, userType);
 
     res.status(201).json({
       success: true,
-      data: { user: { ...user, userType }, token },
+      data: { user: shapeUserForResponse(userType, user), token },
     });
   } catch (err) {
     console.error("Signup error:", err);
@@ -81,10 +185,7 @@ exports.login = async (req, res) => {
 
     const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
-    const result = await query(
-      `SELECT * FROM ${table} WHERE phone = $1`,
-      [phone]
-    );
+    const result = await query(`SELECT * FROM ${table} WHERE phone = $1`, [phone]);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ success: false });
@@ -97,18 +198,33 @@ exports.login = async (req, res) => {
       return res.status(401).json({ success: false });
     }
 
+    if (userType === "partner") {
+      const verificationStatus = String(user.verification_status || "pending").toLowerCase();
+      const isActive = user.is_active === true;
+
+      if (!isActive || verificationStatus !== "approved") {
+        return res.status(403).json({
+          success: false,
+          code: "PARTNER_NOT_APPROVED",
+          message:
+            verificationStatus === "rejected"
+              ? "Your application was rejected"
+              : verificationStatus === "clarification" || verificationStatus === "clarification_needed"
+                ? "Your application needs clarification. Please check your email."
+                : "Your application is pending admin approval. Please wait for approval email.",
+          verification_status: verificationStatus,
+          is_active: isActive,
+          rejection_reason: user.rejection_reason ?? null,
+        });
+      }
+    }
+
     const token = generateToken(user, userType);
 
     res.json({
       success: true,
       data: {
-        user: {
-          id: user.id,
-          name: user.name,
-          phone: user.phone,
-          email: user.email,
-          userType,
-        },
+        user: shapeUserForResponse(userType, user),
         token,
       },
     });
@@ -135,6 +251,14 @@ exports.googleAuth = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "credential (Google ID token) and userType are required",
+      });
+    }
+
+    // Partners must go through manual application + approval.
+    if (String(userType) === "partner") {
+      return res.status(400).json({
+        success: false,
+        message: "Google login is not supported for partners. Please submit an application.",
       });
     }
 
@@ -275,14 +399,17 @@ exports.getCurrentUser = async (req, res) => {
   const { id, userType } = req.user;
   const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
-  const result = await query(
-    `SELECT id, name, phone, email FROM ${table} WHERE id = $1`,
-    [id]
-  );
+  const result =
+    userType === "partner"
+      ? await query(
+          `SELECT id, name, phone, email, company_name, business_address, gst_number, pan_number, verification_status, rejection_reason, is_active FROM ${table} WHERE id = $1`,
+          [id]
+        )
+      : await query(`SELECT id, name, phone, email FROM ${table} WHERE id = $1`, [id]);
 
   res.json({
     success: true,
-    data: { ...result.rows[0], userType },
+    data: shapeUserForResponse(userType, result.rows[0] || {}),
   });
 };
 

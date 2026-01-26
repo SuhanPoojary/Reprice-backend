@@ -3,8 +3,23 @@ const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 
 let _schemaEnsuredPromise = null;
+let _adminAuthSchemaEnsuredPromise = null;
+
+// Avoid running DDL on every request in production/serverless.
+// Default is ON for backward compatibility; set DB_AUTO_MIGRATE=false in production to disable.
+const _dbAutoMigrateFlag = String(process.env.DB_AUTO_MIGRATE || "").trim().toLowerCase();
+const AUTO_MIGRATE_SCHEMA = _dbAutoMigrateFlag !== "false";
+
+// Small cache to protect the DB from accidental UI refresh loops.
+const CACHE_TTL_MS = Number(process.env.ADMIN_API_CACHE_TTL_MS || 10_000);
+const _cache = {
+  dashboardStats: { at: 0, data: null },
+  pendingPartners: { at: 0, data: null },
+  verificationDetailsByPartnerId: new Map(),
+};
 
 async function ensureAdminSchema() {
+  if (!AUTO_MIGRATE_SCHEMA) return;
   if (_schemaEnsuredPromise) return _schemaEnsuredPromise;
 
   _schemaEnsuredPromise = (async () => {
@@ -64,9 +79,48 @@ async function ensureAdminSchema() {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
+
+    // Indexes to keep admin verification screens cheap
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_partners_verification_status_created_at ON partners (verification_status, created_at DESC)"
+    );
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_partners_id_text ON partners ((id::text))"
+    );
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_partner_verification_history_partner_id_created_at ON partner_verification_history (partner_id, created_at DESC)"
+    );
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)"
+    );
   })();
 
   return _schemaEnsuredPromise;
+}
+
+async function ensureAdminAuthSchema() {
+  if (!AUTO_MIGRATE_SCHEMA) return;
+  if (_adminAuthSchemaEnsuredPromise) return _adminAuthSchemaEnsuredPromise;
+
+  _adminAuthSchemaEnsuredPromise = (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admins (
+        id bigserial PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        full_name text,
+        role text NOT NULL DEFAULT 'super_admin',
+        password_hash text NOT NULL,
+        is_active boolean NOT NULL DEFAULT true,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_admins_email_lower ON admins (lower(email))"
+    );
+  })();
+
+  return _adminAuthSchemaEnsuredPromise;
 }
 
 function generateAdminToken(admin) {
@@ -101,17 +155,58 @@ function getConfiguredAdmin() {
   };
 }
 
-exports.adminLogin = async (req, res) => {
-  const { email, password } = req.body ?? {};
+async function getAdminByEmail(email) {
+  await ensureAdminAuthSchema();
+  const result = await pool.query(
+    "SELECT id, email, full_name, role, is_active, password_hash FROM admins WHERE lower(email) = lower($1) LIMIT 1",
+    [String(email || "").trim()]
+  );
+  return result.rows[0] || null;
+}
 
+async function getAdminById(id) {
+  await ensureAdminAuthSchema();
+  const result = await pool.query(
+    "SELECT id, email, full_name, role, is_active FROM admins WHERE id = $1 LIMIT 1",
+    [Number(id)]
+  );
+  return result.rows[0] || null;
+}
+
+async function upsertConfiguredAdminIntoDb() {
   const admin = getConfiguredAdmin();
 
   if (!admin.password && !admin.passwordHash) {
-    return res.status(500).json({
-      success: false,
-      message: "Admin login not configured on server (set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH)",
-    });
+    throw new Error(
+      "Admin bootstrap not configured (set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH)"
+    );
   }
+
+  await ensureAdminAuthSchema();
+
+  const password_hash = admin.passwordHash
+    ? String(admin.passwordHash)
+    : await bcrypt.hash(String(admin.password), 10);
+
+  const result = await pool.query(
+    `
+    INSERT INTO admins (email, full_name, role, password_hash, is_active)
+    VALUES ($1, $2, $3, $4, true)
+    ON CONFLICT (email) DO UPDATE
+      SET full_name = EXCLUDED.full_name,
+          role = EXCLUDED.role,
+          password_hash = EXCLUDED.password_hash,
+          is_active = true
+    RETURNING id, email, full_name, role, is_active
+    `,
+    [admin.email, admin.full_name, admin.role, password_hash]
+  );
+
+  return result.rows[0];
+}
+
+exports.adminLogin = async (req, res) => {
+  const { email, password } = req.body ?? {};
 
   if (!email || !password) {
     return res.status(400).json({
@@ -120,50 +215,97 @@ exports.adminLogin = async (req, res) => {
     });
   }
 
-  if (String(email).trim().toLowerCase() !== admin.email.toLowerCase()) {
-    return res.status(401).json({ success: false, message: "Invalid credentials" });
-  }
-
   const provided = String(password);
 
-  let ok = false;
-  if (admin.passwordHash) {
-    ok = await bcrypt.compare(provided, admin.passwordHash);
-  } else {
-    ok = provided === String(admin.password);
+  try {
+    // Preferred: DB-backed admin
+    const dbAdmin = await getAdminByEmail(email);
+    if (dbAdmin) {
+      if (!dbAdmin.is_active) {
+        return res.status(403).json({ success: false, message: "Admin account disabled" });
+      }
+
+      const ok = await bcrypt.compare(provided, String(dbAdmin.password_hash));
+      if (!ok) {
+        return res.status(401).json({ success: false, message: "Invalid credentials" });
+      }
+
+      const accessToken = generateAdminToken(dbAdmin);
+      return res.json({
+        access_token: accessToken,
+        admin: {
+          id: dbAdmin.id,
+          email: dbAdmin.email,
+          full_name: dbAdmin.full_name,
+          role: dbAdmin.role,
+          is_active: dbAdmin.is_active,
+        },
+      });
+    }
+
+    // Fallback bootstrap: if env admin is configured, allow first login and upsert into DB.
+    const envAdmin = getConfiguredAdmin();
+    if (!envAdmin.password && !envAdmin.passwordHash) {
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+
+    if (String(email).trim().toLowerCase() !== envAdmin.email.toLowerCase()) {
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+
+    let ok = false;
+    if (envAdmin.passwordHash) {
+      ok = await bcrypt.compare(provided, String(envAdmin.passwordHash));
+    } else {
+      ok = provided === String(envAdmin.password);
+    }
+
+    if (!ok) {
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+
+    const inserted = await upsertConfiguredAdminIntoDb();
+    const accessToken = generateAdminToken(inserted);
+    return res.json({
+      access_token: accessToken,
+      admin: inserted,
+    });
+  } catch (e) {
+    console.error("adminLogin error:", e);
+    return res.status(500).json({ success: false, message: "Admin login failed" });
   }
+};
 
-  if (!ok) {
-    return res.status(401).json({ success: false, message: "Invalid credentials" });
-  }
+exports.adminMe = async (req, res) => {
+  try {
+    const dbAdmin = await getAdminById(req.user?.id);
+    if (dbAdmin) return res.json(dbAdmin);
 
-  const accessToken = generateAdminToken(admin);
-
-  return res.json({
-    access_token: accessToken,
-    admin: {
+    // Backward-compatible fallback
+    const admin = getConfiguredAdmin();
+    return res.json({
       id: admin.id,
       email: admin.email,
       full_name: admin.full_name,
       role: admin.role,
       is_active: admin.is_active,
-    },
-  });
-};
-
-exports.adminMe = async (req, res) => {
-  const admin = getConfiguredAdmin();
-  return res.json({
-    id: admin.id,
-    email: admin.email,
-    full_name: admin.full_name,
-    role: admin.role,
-    is_active: admin.is_active,
-  });
+    });
+  } catch (e) {
+    console.error("adminMe error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load admin" });
+  }
 };
 
 exports.getDashboardStats = async (req, res) => {
   await ensureAdminSchema();
+
+  if (
+    CACHE_TTL_MS > 0 &&
+    _cache.dashboardStats.data &&
+    Date.now() - _cache.dashboardStats.at < CACHE_TTL_MS
+  ) {
+    return res.json(_cache.dashboardStats.data);
+  }
 
   try {
     const [customers, partners, agents, orders, ordersByStatus, creditsSum] = await Promise.all([
@@ -176,7 +318,7 @@ exports.getDashboardStats = async (req, res) => {
     ]);
 
     const pendingVerifications = await pool.query(
-      "SELECT COUNT(*)::int AS c FROM partners WHERE verification_status IN ('pending','under_review','clarification_needed')"
+      "SELECT COUNT(*)::int AS c FROM partners WHERE verification_status IN ('pending','under_review','clarification','clarification_needed')"
     );
 
     const revenue = await pool.query(
@@ -188,7 +330,7 @@ exports.getDashboardStats = async (req, res) => {
       orders_by_status[row.status] = row.c;
     }
 
-    res.json({
+    const payload = {
       total_customers: customers.rows[0]?.c ?? 0,
       total_partners: partners.rows[0]?.c ?? 0,
       active_partners: partners.rows[0]?.active ?? 0,
@@ -198,7 +340,10 @@ exports.getDashboardStats = async (req, res) => {
       orders_by_status,
       total_revenue: Number(revenue.rows[0]?.s ?? 0),
       credits_in_circulation: Number(creditsSum.rows[0]?.s ?? 0),
-    });
+    };
+
+    _cache.dashboardStats = { at: Date.now(), data: payload };
+    res.json(payload);
   } catch (err) {
     console.error("ADMIN DASHBOARD STATS ERROR:", err);
     res.status(500).json({ success: false, message: "Failed to compute dashboard stats" });
@@ -246,6 +391,14 @@ exports.listPartners = async (req, res) => {
 exports.listPendingPartners = async (req, res) => {
   await ensureAdminSchema();
 
+  if (
+    CACHE_TTL_MS > 0 &&
+    _cache.pendingPartners.data &&
+    Date.now() - _cache.pendingPartners.at < CACHE_TTL_MS
+  ) {
+    return res.json(_cache.pendingPartners.data);
+  }
+
   try {
     const result = await pool.query(
       `
@@ -260,11 +413,12 @@ exports.listPendingPartners = async (req, res) => {
         COALESCE(is_active, true) AS is_active,
         created_at
       FROM partners
-      WHERE verification_status IN ('pending','under_review','clarification_needed')
+      WHERE verification_status IN ('pending','under_review','clarification','clarification_needed')
       ORDER BY created_at DESC
       `
     );
 
+    _cache.pendingPartners = { at: Date.now(), data: result.rows };
     res.json(result.rows);
   } catch (err) {
     console.error("ADMIN LIST PENDING PARTNERS ERROR:", err);
@@ -277,6 +431,13 @@ exports.getPartnerVerificationDetails = async (req, res) => {
 
   try {
     const partnerId = String(req.params.id);
+
+    if (CACHE_TTL_MS > 0) {
+      const cached = _cache.verificationDetailsByPartnerId.get(partnerId);
+      if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+        return res.json(cached.data);
+      }
+    }
 
     const partnerResult = await pool.query(
       `
@@ -326,11 +487,19 @@ exports.getPartnerVerificationDetails = async (req, res) => {
       ),
     ]);
 
-    res.json({
+    const payload = {
       partner: partnerResult.rows[0],
       serviceable_pincodes: pincodes.rows,
       verification_history: history.rows,
-    });
+    };
+
+    if (CACHE_TTL_MS > 0) {
+      _cache.verificationDetailsByPartnerId.set(partnerId, { at: Date.now(), data: payload });
+      if (_cache.verificationDetailsByPartnerId.size > 500) {
+        _cache.verificationDetailsByPartnerId.clear();
+      }
+    }
+    res.json(payload);
   } catch (err) {
     console.error("ADMIN PARTNER DETAILS ERROR:", err);
     res.status(500).json({ success: false, message: "Failed to fetch partner details" });
@@ -429,7 +598,8 @@ exports.requestClarification = async (req, res) => {
     const result = await pool.query(
       `
       UPDATE partners
-      SET verification_status = 'clarification_needed'
+      SET verification_status = 'clarification',
+          is_active = false
       WHERE id::text = $1
       RETURNING id
       `,
@@ -440,7 +610,7 @@ exports.requestClarification = async (req, res) => {
       return res.status(404).json({ success: false, message: "Partner not found" });
     }
 
-    await writePartnerHistory(partnerId, "clarification_needed", message);
+    await writePartnerHistory(partnerId, "clarification", message);
 
     res.json({ success: true });
   } catch (err) {

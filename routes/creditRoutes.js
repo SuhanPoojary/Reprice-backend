@@ -3,8 +3,9 @@ const router = express.Router();
 
 const creditController = require("../controllers/creditController");
 const { authenticateToken, isPartner } = require("../middleware/authMiddleware");
+const { ensurePartnerApproved } = require("../middleware/partnerApprovalMiddleware");
 
-router.use(authenticateToken, isPartner);
+router.use(authenticateToken, isPartner, ensurePartnerApproved);
 
 router.get("/balance", creditController.getMyCreditBalance);
 router.get("/history", creditController.getMyCreditHistory);
