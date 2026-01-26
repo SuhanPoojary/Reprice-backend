@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../db');
 const { authenticateToken, isPartner } = require('../middleware/authMiddleware');
 const { getRejectedAgentIds, getReturnedAt } = require('../memory/orderMemory');
+const creditService = require('../services/creditService');
 
 const _columnCache = new Map();
 
@@ -35,19 +36,19 @@ router.use(authenticateToken, isPartner);
 // List all orders with agents assigned (orders being managed)
 router.get('/orders', async (req, res) => {
   try {
+    await creditService.ensureCreditSchema();
+    const partnerId = String(req.user.id);
     const hasPartnerId = await hasColumn('agents', 'partner_id');
 
-    // If partner_id exists, scope to this partner's agents only.
-    // If not, we cannot reliably scope without DB changes, so we return the current global behavior.
-    const agentJoin = hasPartnerId
-      ? 'JOIN agents a ON o.agent_id = a.id'
-      : 'LEFT JOIN agents a ON o.agent_id = a.id';
+    // If agents.partner_id exists, scope assigned orders to this partner's agents.
+    // Also include orders this partner has accepted (orders.partner_id = partnerId), even if not yet assigned.
+    const assignedFilter = hasPartnerId
+      ? '(o.agent_id IS NOT NULL AND a.partner_id = $1)'
+      : '(o.agent_id IS NOT NULL)';
 
-    const whereClause = hasPartnerId
-      ? 'WHERE o.agent_id IS NOT NULL AND a.partner_id = $1'
-      : 'WHERE o.agent_id IS NOT NULL';
+    const whereClause = `WHERE (${assignedFilter} OR (o.partner_id::text = $1))`;
 
-    const params = hasPartnerId ? [req.user.id] : [];
+    const params = [partnerId];
 
     const result = await pool.query(
       `
@@ -63,7 +64,9 @@ router.get('/orders', async (req, res) => {
         o.time_slot,
         o.created_at,
         o.agent_id,
-        FALSE AS partner_accepted,
+        o.partner_id,
+        o.credits_charged,
+        CASE WHEN o.partner_id::text = $1 THEN TRUE ELSE FALSE END AS partner_accepted,
 
         c.name AS customer_name,
         c.phone AS customer_phone,
@@ -80,7 +83,7 @@ router.get('/orders', async (req, res) => {
       FROM orders o
       JOIN customers c ON o.customer_id = c.id
       JOIN customer_addresses ca ON o.address_id = ca.id
-      ${agentJoin}
+      LEFT JOIN agents a ON o.agent_id = a.id
       ${whereClause}
       ORDER BY o.created_at DESC
       `
@@ -88,11 +91,18 @@ router.get('/orders', async (req, res) => {
       params
     );
 
-    const orders = result.rows.map((o) => ({
-      ...o,
-      blocked_agent_ids: getRejectedAgentIds(o.id),
-      returned_at: getReturnedAt(o.id),
-    }));
+    const orders = await Promise.all(
+      result.rows.map(async (o) => {
+        const cost = await creditService.getCreditCostForOrder(o);
+        return {
+          ...o,
+          required_credits: cost.credits_required,
+          credit_product_key: cost.product_key,
+          blocked_agent_ids: getRejectedAgentIds(o.id),
+          returned_at: getReturnedAt(o.id),
+        };
+      })
+    );
 
     res.json({ success: true, orders });
   } catch (err) {
@@ -138,15 +148,23 @@ router.get('/orders/available', async (req, res) => {
       LEFT JOIN agents a ON o.agent_id = a.id
       WHERE o.status = 'pending'
         AND o.agent_id IS NULL
+        AND (o.partner_id IS NULL OR o.partner_id = '')
       ORDER BY o.created_at DESC
       `
     );
 
-    const orders = result.rows.map((o) => ({
-      ...o,
-      blocked_agent_ids: getRejectedAgentIds(o.id),
-      returned_at: getReturnedAt(o.id),
-    }));
+    const orders = await Promise.all(
+      result.rows.map(async (o) => {
+        const cost = await creditService.getCreditCostForOrder(o);
+        return {
+          ...o,
+          required_credits: cost.credits_required,
+          credit_product_key: cost.product_key,
+          blocked_agent_ids: getRejectedAgentIds(o.id),
+          returned_at: getReturnedAt(o.id),
+        };
+      })
+    );
 
     res.json({ success: true, orders });
   } catch (err) {
@@ -257,12 +275,97 @@ router.post('/agents', async (req, res) => {
 router.patch('/orders/:id/accept', async (req, res) => {
   try {
     const orderId = req.params.id;
-    
-    console.log('ACCEPT ORDER - orderId:', orderId);
-    
-    // Since there's no partner_accepted column in the data,
-    // we just return success - the UI will track acceptance state
-    res.json({ success: true, order: { id: orderId } });
+
+    await creditService.ensureCreditSchema();
+
+    const partnerId = String(req.user.id);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Lock the order so only one partner can accept it.
+      const orderRes = await client.query(
+        `
+        SELECT *
+        FROM orders
+        WHERE id::text = $1
+        FOR UPDATE
+        `,
+        [String(orderId)]
+      );
+
+      if (orderRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ success: false, message: 'Order not found' });
+      }
+
+      const order = orderRes.rows[0];
+
+      if (order.partner_id && String(order.partner_id) !== partnerId) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, message: 'Order already accepted by another partner' });
+      }
+
+      if (order.status !== 'pending' || order.agent_id) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, message: 'Order is not available to accept' });
+      }
+
+      const { credits_required, product_key } = await creditService.getCreditCostForOrder(order);
+
+      try {
+        await creditService.deductCredits({
+          partnerId,
+          credits: credits_required,
+          referenceType: 'order_accept',
+          referenceId: String(orderId),
+          message: `Accepted order ${order.order_number || orderId}`,
+          metadata: { product_key, credits_required },
+          client,
+        });
+      } catch (e) {
+        if (e?.code === 'INSUFFICIENT_CREDITS') {
+          await client.query('ROLLBACK');
+          return res.status(402).json({
+            success: false,
+            message: 'Insufficient Credits',
+            required_credits: credits_required,
+            balance: e.balance,
+            product_key,
+          });
+        }
+        throw e;
+      }
+
+      const updated = await client.query(
+        `
+        UPDATE orders
+        SET partner_id = $2,
+            credits_charged = $3
+        WHERE id::text = $1
+        RETURNING *
+        `,
+        [String(orderId), partnerId, Number(credits_required)]
+      );
+
+      await client.query('COMMIT');
+
+      return res.json({
+        success: true,
+        order: updated.rows[0],
+        required_credits: credits_required,
+        credit_product_key: product_key,
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error('PARTNER ACCEPT ORDER ERROR:', err);
     res.status(500).json({ success: false, message: 'Failed to accept order' });
@@ -292,13 +395,14 @@ router.patch('/orders/:id/assign-agent', async (req, res) => {
       WHERE id = $2
         AND status = 'pending'
         AND agent_id IS NULL
+        AND partner_id::text = $3
       RETURNING *
       `,
-      [agentId, orderId]
+      [agentId, orderId, String(req.user.id)]
     );
 
     if (result.rows.length === 0) {
-      return res.status(409).json({ success: false, message: 'Order already assigned or not available' });
+      return res.status(409).json({ success: false, message: 'Order already assigned, not accepted by you, or not available' });
     }
 
     res.json({ success: true, order: result.rows[0] });
