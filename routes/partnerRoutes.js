@@ -8,6 +8,7 @@ const { authenticateToken, isPartner } = require('../middleware/authMiddleware')
 const { ensurePartnerApproved } = require('../middleware/partnerApprovalMiddleware');
 const { getRejectedAgentIds, getReturnedAt } = require('../memory/orderMemory');
 const creditService = require('../services/creditService');
+const { normalizePincode } = require('../services/indiaPostService');
 
 const _columnCache = new Map();
 
@@ -38,7 +39,82 @@ async function hasColumn(tableName, columnName) {
   return exists;
 }
 
+async function ensurePartnerHubSchema() {
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_latitude double precision",
+    []
+  );
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_longitude double precision",
+    []
+  );
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_updated_at timestamptz",
+    []
+  );
+}
+
+async function ensurePartnerServiceablePincodesSchema() {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
+      id bigserial PRIMARY KEY,
+      partner_id text NOT NULL,
+      pincode text NOT NULL,
+      city text,
+      state text,
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+    `
+  );
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)",
+    []
+  );
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_pincode_active ON partner_serviceable_pincodes (pincode, is_active)",
+    []
+  );
+}
+
 router.use(authenticateToken, isPartner, ensurePartnerApproved);
+
+// Persist partner hub location (used for serviceability checks)
+router.patch('/hub', async (req, res) => {
+  try {
+    const partnerId = getPartnerId(req);
+    if (!partnerId) {
+      return res.status(401).json({ success: false, message: 'Invalid partner identity' });
+    }
+
+    const latitude = req?.body?.latitude ?? req?.body?.lat;
+    const longitude = req?.body?.longitude ?? req?.body?.lng;
+
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({ success: false, message: 'latitude and longitude are required' });
+    }
+
+    await ensurePartnerHubSchema();
+
+    const result = await pool.query(
+      `
+      UPDATE partners
+      SET hub_latitude = $1,
+          hub_longitude = $2,
+          hub_updated_at = NOW()
+      WHERE id::text = $3
+      RETURNING hub_latitude, hub_longitude, hub_updated_at
+      `,
+      [Number(latitude), Number(longitude), partnerId]
+    );
+
+    res.json({ success: true, hub: result.rows[0] ?? null });
+  } catch (err) {
+    console.error('PARTNER UPDATE HUB ERROR:', err);
+    res.status(500).json({ success: false, message: 'Failed to update hub location' });
+  }
+});
 
 // List all orders with agents assigned (orders being managed)
 router.get('/orders', async (req, res) => {
@@ -144,6 +220,13 @@ router.get('/orders', async (req, res) => {
 // List unassigned orders available for partners to accept (pending, no agent)
 router.get('/orders/available', async (req, res) => {
   try {
+    const partnerId = getPartnerId(req);
+    if (!partnerId) {
+      return res.status(401).json({ success: false, message: 'Invalid partner identity' });
+    }
+
+    await ensurePartnerServiceablePincodesSchema();
+
     const result = await pool.query(
       `
       SELECT
@@ -184,8 +267,17 @@ router.get('/orders/available', async (req, res) => {
       WHERE o.status = 'pending'
         AND o.agent_id IS NULL
         AND NULLIF(o.partner_id::text, '') IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM partner_serviceable_pincodes sp
+          WHERE sp.partner_id::text = $1
+            AND sp.is_active = true
+            AND regexp_replace(sp.pincode, '\\D', '', 'g') = regexp_replace(ca.pincode, '\\D', '', 'g')
+        )
       ORDER BY o.created_at DESC
       `
+      ,
+      [partnerId]
     );
 
     const orders = await Promise.all(
@@ -355,6 +447,51 @@ router.patch('/orders/:id/accept', async (req, res) => {
       }
 
       const order = orderRes.rows[0];
+
+      // Enforce pincode serviceability for this partner.
+      try {
+        await ensurePartnerServiceablePincodesSchema();
+        const pinRes = await client.query(
+          `
+          SELECT ca.pincode
+          FROM customer_addresses ca
+          WHERE ca.id = $1
+          LIMIT 1
+          `,
+          [order.address_id]
+        );
+
+        const orderPinRaw = pinRes.rows[0]?.pincode;
+        const orderPin = normalizePincode(orderPinRaw);
+
+        const okRes = await client.query(
+          `
+          SELECT 1
+          FROM partner_serviceable_pincodes sp
+          WHERE sp.partner_id::text = $1
+            AND sp.is_active = true
+            AND regexp_replace(sp.pincode, '\\D', '', 'g') = $2
+          LIMIT 1
+          `,
+          [partnerId, orderPin]
+        );
+
+        if (okRes.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(422).json({
+            success: false,
+            code: 'NOT_SERVICEABLE',
+            message: 'Order not servicable in your region. pls change ur pincode',
+          });
+        }
+      } catch {
+        // If schema check fails unexpectedly, be safe and block accept.
+        await client.query('ROLLBACK');
+        return res.status(503).json({
+          success: false,
+          message: 'Serviceability check is unavailable. Please try again.',
+        });
+      }
 
       if (order.partner_id && String(order.partner_id) !== partnerId) {
         await client.query('ROLLBACK');

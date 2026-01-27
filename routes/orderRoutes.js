@@ -5,6 +5,164 @@ const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { noteAgentRejected } = require("../memory/orderMemory");
 const creditService = require("../services/creditService");
+const {
+  lookupByPincode,
+  normalizePincode,
+  isValidIndianPincode,
+} = require("../services/indiaPostService");
+
+async function ensurePartnerServiceablePincodesSchema() {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
+      id bigserial PRIMARY KEY,
+      partner_id text NOT NULL,
+      pincode text NOT NULL,
+      city text,
+      state text,
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+    `
+  );
+
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)"
+  );
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_pincode_active ON partner_serviceable_pincodes (pincode, is_active)"
+  );
+}
+
+async function hasApprovedPartnerForPincode(pincode) {
+  const pin = normalizePincode(pincode);
+  if (!pin) return false;
+
+  await ensurePartnerServiceablePincodesSchema();
+
+  const hasIsActive = await hasColumn("partners", "is_active");
+  const hasVerification = await hasColumn("partners", "verification_status");
+
+  const partnerFilters = ["1=1"];
+  if (hasIsActive) partnerFilters.push("p.is_active = true");
+  if (hasVerification) partnerFilters.push("LOWER(COALESCE(p.verification_status,'')) = 'approved'");
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM partner_serviceable_pincodes sp
+    JOIN partners p ON p.id::text = sp.partner_id
+    WHERE regexp_replace(sp.pincode, '\\D', '', 'g') = $1
+      AND sp.is_active = true
+      AND ${partnerFilters.join(" AND ")}
+    LIMIT 1
+    `,
+    [pin]
+  );
+
+  return result.rows.length > 0;
+}
+
+const _schemaCache = new Map();
+
+async function hasColumn(tableName, columnName) {
+  const key = `col:${tableName}.${columnName}`;
+  if (_schemaCache.has(key)) return _schemaCache.get(key);
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = $1
+      AND column_name = $2
+    LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  const exists = result.rows.length > 0;
+  _schemaCache.set(key, exists);
+  return exists;
+}
+
+async function hasTable(tableName) {
+  const key = `tbl:${tableName}`;
+  if (_schemaCache.has(key)) return _schemaCache.get(key);
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = $1
+    LIMIT 1
+    `,
+    [tableName]
+  );
+
+  const exists = result.rows.length > 0;
+  _schemaCache.set(key, exists);
+  return exists;
+}
+
+async function isAnyAgentWithinKm(lat, lng, km) {
+  const [hasLat, hasLng] = await Promise.all([
+    hasColumn('agents', 'latitude'),
+    hasColumn('agents', 'longitude'),
+  ]);
+
+  if (!hasLat || !hasLng) return false;
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM agents a
+    WHERE a.latitude IS NOT NULL
+      AND a.longitude IS NOT NULL
+      AND (
+        6371 * acos(
+          LEAST(
+            1,
+            GREATEST(
+              -1,
+              cos(radians($1))
+              * cos(radians(a.latitude))
+              * cos(radians(a.longitude) - radians($2))
+              + sin(radians($1))
+              * sin(radians(a.latitude))
+            )
+          )
+        )
+      ) <= $3
+    LIMIT 1
+    `,
+    [Number(lat), Number(lng), Number(km)]
+  );
+
+  return result.rows.length > 0;
+}
+
+async function isAnyPartnerServingPincode(pincode) {
+  const pin = String(pincode || '').trim();
+  if (!pin) return false;
+
+  const exists = await hasTable('partner_serviceable_pincodes');
+  if (!exists) return false;
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM partner_serviceable_pincodes
+    WHERE is_active = true
+      AND pincode = $1
+    LIMIT 1
+    `,
+    [pin]
+  );
+
+  return result.rows.length > 0;
+}
 
 router.post("/create", authenticateToken, async (req, res) => {
   try {
@@ -21,12 +179,41 @@ router.post("/create", authenticateToken, async (req, res) => {
       paymentMethod,
     } = req.body;
 
-    if (latitude == null || longitude == null) {
+    // Serviceability gate (authoritative): validate using customer-entered pincode.
+    // This prevents accepting orders just because the customer's live GPS (lat/lon) is near a partner.
+    const normalizedPincode = normalizePincode(pincode);
+    if (!isValidIndianPincode(normalizedPincode)) {
       return res.status(400).json({
         success: false,
-        message: "Location access is required to place the order",
+        code: 'INVALID_PINCODE',
+        message: 'Please enter a valid 6-digit pincode.',
       });
     }
+
+    const pinLookup = await lookupByPincode(normalizedPincode);
+    if (!pinLookup.ok) {
+      return res
+        .status(pinLookup.errorType === 'NOT_FOUND' || pinLookup.errorType === 'INVALID_PIN' ? 400 : 503)
+        .json({
+          success: false,
+          code: 'INVALID_PINCODE',
+          message:
+            pinLookup.errorType === 'NOT_FOUND'
+              ? 'Please enter a valid 6-digit pincode.'
+              : pinLookup.message || 'PIN Code validation service is unavailable. Please try again.',
+        });
+    }
+
+    const serviceableByPin = await hasApprovedPartnerForPincode(normalizedPincode);
+    if (!serviceableByPin) {
+      return res.status(422).json({
+        success: false,
+        code: "NOT_SERVICEABLE",
+        message: "Order not servicable in your region. pls change ur pincode",
+      });
+    }
+
+    // Location is optional; serviceability is determined by PIN.
 
     const customerId = req.user.id;
 
@@ -35,7 +222,15 @@ router.post("/create", authenticateToken, async (req, res) => {
        (customer_id, full_address, city, state, pincode, latitude, longitude)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id`,
-      [customerId, address, city, state || "", pincode, latitude, longitude]
+      [
+        customerId,
+        address,
+        city || pinLookup.district || '',
+        state || pinLookup.state || "",
+        normalizedPincode,
+        latitude ?? null,
+        longitude ?? null,
+      ]
     );
 
     const addressId = addressResult.rows[0].id;
@@ -331,15 +526,18 @@ router.get("/my", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
-        order_number,
-        phone_model,
-        price,
-        status,
-        created_at
-      FROM orders
-      WHERE customer_id = $1
-      ORDER BY created_at DESC
+        o.id,
+        o.order_number,
+        o.phone_model,
+        o.price,
+        o.status,
+        o.created_at,
+        a.name AS agent_name,
+        a.phone AS agent_phone
+      FROM orders o
+      LEFT JOIN agents a ON o.agent_id = a.id
+      WHERE o.customer_id = $1
+      ORDER BY o.created_at DESC
       `,
       [customerId]
     );

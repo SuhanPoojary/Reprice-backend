@@ -2,6 +2,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const { query } = require("../db");
+const { lookupByPincode, normalizePincode } = require("../services/indiaPostService");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -22,14 +23,40 @@ function getPartnerApplicationFields(body) {
   const gstNumber = src.gst_number ?? src.gstNumber;
   const panNumber = src.pan_number ?? src.panNumber;
   const messageFromPartner = src.message_from_partner ?? src.messageFromPartner;
+  const pincode = src.pincode ?? src.service_pincode ?? src.servicePincode;
 
   return {
     company_name: companyName ? String(companyName).trim() : null,
     business_address: businessAddress ? String(businessAddress).trim() : null,
+    pincode: pincode ? String(pincode).trim() : null,
     gst_number: gstNumber ? String(gstNumber).trim() : null,
     pan_number: panNumber ? String(panNumber).trim() : null,
     message_from_partner: messageFromPartner ? String(messageFromPartner).trim() : null,
   };
+}
+
+async function ensurePartnerServiceablePincodesSchema() {
+  // Keep this idempotent; partner signup may run before admin has ever opened the dashboard.
+  await query(`
+    CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
+      id bigserial PRIMARY KEY,
+      partner_id text NOT NULL,
+      pincode text NOT NULL,
+      city text,
+      state text,
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  await query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)",
+    []
+  );
+  await query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_pincode_active ON partner_serviceable_pincodes (pincode, is_active)",
+    []
+  );
 }
 
 function shapeUserForResponse(userType, row) {
@@ -98,6 +125,26 @@ exports.signup = async (req, res) => {
 
     const partnerFields = userType === "partner" ? getPartnerApplicationFields(req.body) : null;
 
+    if (userType === 'partner') {
+      const pin = partnerFields?.pincode ? normalizePincode(partnerFields.pincode) : '';
+      if (!pin) {
+        return res.status(400).json({ success: false, message: 'Service pincode is required' });
+      }
+      const pinLookup = await lookupByPincode(pin);
+      if (!pinLookup.ok) {
+        return res.status(pinLookup.errorType === 'NOT_FOUND' || pinLookup.errorType === 'INVALID_PIN' ? 400 : 503).json({
+          success: false,
+          message:
+            pinLookup.errorType === 'NOT_FOUND'
+              ? 'Please enter a valid 6-digit pincode.'
+              : pinLookup.message || 'PIN Code validation service is unavailable. Please try again.',
+        });
+      }
+
+      // Store back normalized pin (digits only) so DB matches order pincodes.
+      partnerFields.pincode = pin;
+    }
+
     const result =
       userType === "partner"
         ? await query(
@@ -136,6 +183,21 @@ exports.signup = async (req, res) => {
     const user = result.rows[0];
 
     if (userType === "partner") {
+      // Best-effort: store partner's service pincode for serviceability checks.
+      try {
+        const pin = partnerFields?.pincode ? normalizePincode(partnerFields.pincode) : "";
+        if (pin) {
+          await ensurePartnerServiceablePincodesSchema();
+          await query(
+            `INSERT INTO partner_serviceable_pincodes (partner_id, pincode, is_active)
+             VALUES ($1, $2, true)`,
+            [String(user.id), pin]
+          );
+        }
+      } catch {
+        // ignore
+      }
+
       // Best-effort: record application submission event for admin timeline.
       try {
         const message = partnerFields?.message_from_partner || "Application submitted";
