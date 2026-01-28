@@ -6,6 +6,57 @@ const { lookupByPincode, normalizePincode } = require("../services/indiaPostServ
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
+let _partnerSchemaEnsuredPromise = null;
+
+async function ensurePartnerSchema() {
+  if (_partnerSchemaEnsuredPromise) return _partnerSchemaEnsuredPromise;
+
+  _partnerSchemaEnsuredPromise = (async () => {
+    // Make partner application columns safe even if admin endpoints haven't run yet.
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS company_name text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_address text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS gst_number text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS pan_number text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS verification_status text DEFAULT 'pending'");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS rejection_reason text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS credit_balance numeric DEFAULT 0");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS is_active boolean DEFAULT false");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()");
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS partner_verification_history (
+        id bigserial PRIMARY KEY,
+        partner_id text NOT NULL,
+        action_type text NOT NULL,
+        message_from_admin text,
+        message_from_partner text,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
+        id bigserial PRIMARY KEY,
+        partner_id text NOT NULL,
+        pincode text NOT NULL,
+        city text,
+        state text,
+        is_active boolean NOT NULL DEFAULT true,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    await query(
+      "CREATE INDEX IF NOT EXISTS idx_partner_verification_history_partner_id_created_at ON partner_verification_history (partner_id, created_at DESC)"
+    );
+    await query(
+      "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)"
+    );
+  })();
+
+  return _partnerSchemaEnsuredPromise;
+}
+
 // Helper function to generate JWT token
 const generateToken = (user, userType) => {
   return jwt.sign(
@@ -23,15 +74,20 @@ function getPartnerApplicationFields(body) {
   const gstNumber = src.gst_number ?? src.gstNumber;
   const panNumber = src.pan_number ?? src.panNumber;
   const messageFromPartner = src.message_from_partner ?? src.messageFromPartner;
-  const pincode = src.pincode ?? src.service_pincode ?? src.servicePincode;
+  const pincode =
+    src.pincode ??
+    src.service_pincode ??
+    src.servicePincode ??
+    src.serviceable_pincode ??
+    src.serviceablePincode;
 
   return {
     company_name: companyName ? String(companyName).trim() : null,
     business_address: businessAddress ? String(businessAddress).trim() : null,
-    pincode: pincode ? String(pincode).trim() : null,
     gst_number: gstNumber ? String(gstNumber).trim() : null,
     pan_number: panNumber ? String(panNumber).trim() : null,
     message_from_partner: messageFromPartner ? String(messageFromPartner).trim() : null,
+    pincode: pincode ? String(pincode).trim() : null,
   };
 }
 
@@ -105,6 +161,10 @@ exports.signup = async (req, res) => {
         success: false,
         message: 'Invalid user type. Must be "customer", "agent" or "partner"',
       });
+    }
+
+    if (userType === "partner") {
+      await ensurePartnerSchema();
     }
 
     const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
@@ -206,6 +266,21 @@ exports.signup = async (req, res) => {
            VALUES ($1, 'submitted', $2)`,
           [String(user.id), message]
         );
+      } catch {
+        // ignore
+      }
+
+      // Best-effort: store a first serviceable pincode from the application.
+      try {
+        if (partnerFields?.pincode) {
+          await query(
+            `
+            INSERT INTO partner_serviceable_pincodes (partner_id, pincode, is_active)
+            VALUES ($1, $2, true)
+            `,
+            [String(user.id), String(partnerFields.pincode)]
+          );
+        }
       } catch {
         // ignore
       }

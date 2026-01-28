@@ -10,6 +10,9 @@ const {
   normalizePincode,
   isValidIndianPincode,
 } = require("../services/indiaPostService");
+const { isServiceableForPartnerPins } = require("../services/pincodeRadiusService");
+
+const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
 async function ensurePartnerServiceablePincodesSchema() {
   await pool.query(
@@ -49,18 +52,19 @@ async function hasApprovedPartnerForPincode(pincode) {
 
   const result = await pool.query(
     `
-    SELECT 1
+    SELECT DISTINCT regexp_replace(sp.pincode, '\\D', '', 'g') AS pincode
     FROM partner_serviceable_pincodes sp
     JOIN partners p ON p.id::text = sp.partner_id
-    WHERE regexp_replace(sp.pincode, '\\D', '', 'g') = $1
-      AND sp.is_active = true
+    WHERE sp.is_active = true
       AND ${partnerFilters.join(" AND ")}
-    LIMIT 1
-    `,
-    [pin]
+    `
   );
 
-  return result.rows.length > 0;
+  const partnerPins = result.rows.map((r) => r.pincode).filter(Boolean);
+  if (partnerPins.length === 0) return false;
+
+  const svc = await isServiceableForPartnerPins(pin, partnerPins, SERVICE_RADIUS_KM);
+  return svc.ok ? svc.serviceable : false;
 }
 
 const _schemaCache = new Map();

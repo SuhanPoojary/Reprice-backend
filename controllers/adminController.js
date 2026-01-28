@@ -619,6 +619,34 @@ exports.requestClarification = async (req, res) => {
   }
 };
 
+exports.removePartner = async (req, res) => {
+  try {
+    await ensureAdminSchema();
+    const partnerId = String(req.params.id);
+
+    const result = await pool.query(
+      `
+      UPDATE partners
+      SET is_active = false,
+          verification_status = 'removed'
+      WHERE id::text = $1
+      RETURNING id
+      `,
+      [partnerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Partner not found" });
+    }
+
+    await writePartnerHistory(partnerId, "removed", "Partner removed by admin");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("ADMIN REMOVE PARTNER ERROR:", err);
+    res.status(500).json({ success: false, message: "Failed to remove partner" });
+  }
+};
+
 exports.listOrders = async (req, res) => {
   await ensureAdminSchema();
 

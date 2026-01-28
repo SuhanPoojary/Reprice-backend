@@ -46,6 +46,13 @@ router.post(
   adminController.requestClarification
 );
 
+router.delete(
+  "/partners/:id",
+  authenticateToken,
+  isAdmin,
+  adminController.removePartner
+);
+
 // Orders
 router.get("/orders", authenticateToken, isAdmin, adminController.listOrders);
 

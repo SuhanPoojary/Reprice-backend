@@ -9,6 +9,9 @@ const { ensurePartnerApproved } = require('../middleware/partnerApprovalMiddlewa
 const { getRejectedAgentIds, getReturnedAt } = require('../memory/orderMemory');
 const creditService = require('../services/creditService');
 const { normalizePincode } = require('../services/indiaPostService');
+const { isServiceableForPartnerPins } = require('../services/pincodeRadiusService');
+
+const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
 const _columnCache = new Map();
 
@@ -227,6 +230,21 @@ router.get('/orders/available', async (req, res) => {
 
     await ensurePartnerServiceablePincodesSchema();
 
+    const pinsRes = await pool.query(
+      `
+      SELECT DISTINCT regexp_replace(pincode, '\\D', '', 'g') AS pincode
+      FROM partner_serviceable_pincodes
+      WHERE partner_id::text = $1
+        AND is_active = true
+      `,
+      [partnerId]
+    );
+
+    const partnerPins = pinsRes.rows.map((r) => r.pincode).filter(Boolean);
+    if (partnerPins.length === 0) {
+      return res.json({ success: true, orders: [] });
+    }
+
     const result = await pool.query(
       `
       SELECT
@@ -267,20 +285,11 @@ router.get('/orders/available', async (req, res) => {
       WHERE o.status = 'pending'
         AND o.agent_id IS NULL
         AND NULLIF(o.partner_id::text, '') IS NULL
-        AND EXISTS (
-          SELECT 1
-          FROM partner_serviceable_pincodes sp
-          WHERE sp.partner_id::text = $1
-            AND sp.is_active = true
-            AND regexp_replace(sp.pincode, '\\D', '', 'g') = regexp_replace(ca.pincode, '\\D', '', 'g')
-        )
       ORDER BY o.created_at DESC
       `
-      ,
-      [partnerId]
     );
 
-    const orders = await Promise.all(
+    const enriched = await Promise.all(
       result.rows.map(async (o) => {
         const cost = await creditService.getCreditCostForOrder(o);
         const originalPrice = Number(o.original_price ?? o.price ?? 0);
@@ -307,6 +316,17 @@ router.get('/orders/available', async (req, res) => {
         };
       })
     );
+
+    const orders = [];
+    for (const o of enriched) {
+      const orderPin = normalizePincode(o?.pincode);
+      if (!orderPin) continue;
+
+      const svc = await isServiceableForPartnerPins(orderPin, partnerPins, SERVICE_RADIUS_KM);
+      if (svc.ok && svc.serviceable) {
+        orders.push(o);
+      }
+    }
 
     res.json({ success: true, orders });
   } catch (err) {
@@ -448,7 +468,7 @@ router.patch('/orders/:id/accept', async (req, res) => {
 
       const order = orderRes.rows[0];
 
-      // Enforce pincode serviceability for this partner.
+      // Enforce pincode serviceability for this partner (exact pin OR within radius).
       try {
         await ensurePartnerServiceablePincodesSchema();
         const pinRes = await client.query(
@@ -464,19 +484,20 @@ router.patch('/orders/:id/accept', async (req, res) => {
         const orderPinRaw = pinRes.rows[0]?.pincode;
         const orderPin = normalizePincode(orderPinRaw);
 
-        const okRes = await client.query(
+        const pinsRes = await client.query(
           `
-          SELECT 1
-          FROM partner_serviceable_pincodes sp
-          WHERE sp.partner_id::text = $1
-            AND sp.is_active = true
-            AND regexp_replace(sp.pincode, '\\D', '', 'g') = $2
-          LIMIT 1
+          SELECT DISTINCT regexp_replace(pincode, '\\D', '', 'g') AS pincode
+          FROM partner_serviceable_pincodes
+          WHERE partner_id::text = $1
+            AND is_active = true
           `,
-          [partnerId, orderPin]
+          [partnerId]
         );
 
-        if (okRes.rows.length === 0) {
+        const partnerPins = pinsRes.rows.map((r) => r.pincode).filter(Boolean);
+        const svc = await isServiceableForPartnerPins(orderPin, partnerPins, SERVICE_RADIUS_KM);
+
+        if (!svc.ok || !svc.serviceable) {
           await client.query('ROLLBACK');
           return res.status(422).json({
             success: false,
