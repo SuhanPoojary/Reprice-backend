@@ -8,6 +8,10 @@ const { authenticateToken, isPartner } = require('../middleware/authMiddleware')
 const { ensurePartnerApproved } = require('../middleware/partnerApprovalMiddleware');
 const { getRejectedAgentIds, getReturnedAt } = require('../memory/orderMemory');
 const creditService = require('../services/creditService');
+const { normalizePincode } = require('../services/indiaPostService');
+const { isServiceableForPartnerPins } = require('../services/pincodeRadiusService');
+
+const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
 const _columnCache = new Map();
 
@@ -38,7 +42,82 @@ async function hasColumn(tableName, columnName) {
   return exists;
 }
 
+async function ensurePartnerHubSchema() {
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_latitude double precision",
+    []
+  );
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_longitude double precision",
+    []
+  );
+  await pool.query(
+    "ALTER TABLE partners ADD COLUMN IF NOT EXISTS hub_updated_at timestamptz",
+    []
+  );
+}
+
+async function ensurePartnerServiceablePincodesSchema() {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
+      id bigserial PRIMARY KEY,
+      partner_id text NOT NULL,
+      pincode text NOT NULL,
+      city text,
+      state text,
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+    `
+  );
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_partner_id ON partner_serviceable_pincodes (partner_id)",
+    []
+  );
+  await pool.query(
+    "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_pincode_active ON partner_serviceable_pincodes (pincode, is_active)",
+    []
+  );
+}
+
 router.use(authenticateToken, isPartner, ensurePartnerApproved);
+
+// Persist partner hub location (used for serviceability checks)
+router.patch('/hub', async (req, res) => {
+  try {
+    const partnerId = getPartnerId(req);
+    if (!partnerId) {
+      return res.status(401).json({ success: false, message: 'Invalid partner identity' });
+    }
+
+    const latitude = req?.body?.latitude ?? req?.body?.lat;
+    const longitude = req?.body?.longitude ?? req?.body?.lng;
+
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({ success: false, message: 'latitude and longitude are required' });
+    }
+
+    await ensurePartnerHubSchema();
+
+    const result = await pool.query(
+      `
+      UPDATE partners
+      SET hub_latitude = $1,
+          hub_longitude = $2,
+          hub_updated_at = NOW()
+      WHERE id::text = $3
+      RETURNING hub_latitude, hub_longitude, hub_updated_at
+      `,
+      [Number(latitude), Number(longitude), partnerId]
+    );
+
+    res.json({ success: true, hub: result.rows[0] ?? null });
+  } catch (err) {
+    console.error('PARTNER UPDATE HUB ERROR:', err);
+    res.status(500).json({ success: false, message: 'Failed to update hub location' });
+  }
+});
 
 // List all orders with agents assigned (orders being managed)
 router.get('/orders', async (req, res) => {
@@ -144,6 +223,28 @@ router.get('/orders', async (req, res) => {
 // List unassigned orders available for partners to accept (pending, no agent)
 router.get('/orders/available', async (req, res) => {
   try {
+    const partnerId = getPartnerId(req);
+    if (!partnerId) {
+      return res.status(401).json({ success: false, message: 'Invalid partner identity' });
+    }
+
+    await ensurePartnerServiceablePincodesSchema();
+
+    const pinsRes = await pool.query(
+      `
+      SELECT DISTINCT regexp_replace(pincode, '\\D', '', 'g') AS pincode
+      FROM partner_serviceable_pincodes
+      WHERE partner_id::text = $1
+        AND is_active = true
+      `,
+      [partnerId]
+    );
+
+    const partnerPins = pinsRes.rows.map((r) => r.pincode).filter(Boolean);
+    if (partnerPins.length === 0) {
+      return res.json({ success: true, orders: [] });
+    }
+
     const result = await pool.query(
       `
       SELECT
@@ -188,7 +289,7 @@ router.get('/orders/available', async (req, res) => {
       `
     );
 
-    const orders = await Promise.all(
+    const enriched = await Promise.all(
       result.rows.map(async (o) => {
         const cost = await creditService.getCreditCostForOrder(o);
         const originalPrice = Number(o.original_price ?? o.price ?? 0);
@@ -215,6 +316,17 @@ router.get('/orders/available', async (req, res) => {
         };
       })
     );
+
+    const orders = [];
+    for (const o of enriched) {
+      const orderPin = normalizePincode(o?.pincode);
+      if (!orderPin) continue;
+
+      const svc = await isServiceableForPartnerPins(orderPin, partnerPins, SERVICE_RADIUS_KM);
+      if (svc.ok && svc.serviceable) {
+        orders.push(o);
+      }
+    }
 
     res.json({ success: true, orders });
   } catch (err) {
@@ -355,6 +467,52 @@ router.patch('/orders/:id/accept', async (req, res) => {
       }
 
       const order = orderRes.rows[0];
+
+      // Enforce pincode serviceability for this partner (exact pin OR within radius).
+      try {
+        await ensurePartnerServiceablePincodesSchema();
+        const pinRes = await client.query(
+          `
+          SELECT ca.pincode
+          FROM customer_addresses ca
+          WHERE ca.id = $1
+          LIMIT 1
+          `,
+          [order.address_id]
+        );
+
+        const orderPinRaw = pinRes.rows[0]?.pincode;
+        const orderPin = normalizePincode(orderPinRaw);
+
+        const pinsRes = await client.query(
+          `
+          SELECT DISTINCT regexp_replace(pincode, '\\D', '', 'g') AS pincode
+          FROM partner_serviceable_pincodes
+          WHERE partner_id::text = $1
+            AND is_active = true
+          `,
+          [partnerId]
+        );
+
+        const partnerPins = pinsRes.rows.map((r) => r.pincode).filter(Boolean);
+        const svc = await isServiceableForPartnerPins(orderPin, partnerPins, SERVICE_RADIUS_KM);
+
+        if (!svc.ok || !svc.serviceable) {
+          await client.query('ROLLBACK');
+          return res.status(422).json({
+            success: false,
+            code: 'NOT_SERVICEABLE',
+            message: 'Order not servicable in your region. pls change ur pincode',
+          });
+        }
+      } catch {
+        // If schema check fails unexpectedly, be safe and block accept.
+        await client.query('ROLLBACK');
+        return res.status(503).json({
+          success: false,
+          message: 'Serviceability check is unavailable. Please try again.',
+        });
+      }
 
       if (order.partner_id && String(order.partner_id) !== partnerId) {
         await client.query('ROLLBACK');
