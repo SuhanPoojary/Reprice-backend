@@ -23,6 +23,7 @@ const allowedOrigins = new Set([
   "http://localhost:5174",
   "http://localhost:3000",
   "https://reprice-ai-omega.vercel.app",
+  "https://reprice-admin-1.vercel.app",
   "https://reprice-agent-partner.vercel.app",
 ]);
 
@@ -34,6 +35,10 @@ if (process.env.FRONTEND_URL) {
 // Matches: https://reprice-agent-partner-<anything>.vercel.app
 const vercelPreviewOriginRegex =
   /^https:\/\/reprice-agent-partner-[a-z0-9-]+\.vercel\.app$/i;
+
+// Matches: https://reprice-admin-<anything>.vercel.app
+const vercelAdminPreviewOriginRegex =
+  /^https:\/\/reprice-admin-[a-z0-9-]+\.vercel\.app$/i;
 
 // In dev, Vite may shift ports (5173, 5174, ...)
 const localhostOriginRegex = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
@@ -48,6 +53,7 @@ const corsOptions = {
     if (
       allowedOrigins.has(origin) ||
       vercelPreviewOriginRegex.test(origin) ||
+      vercelAdminPreviewOriginRegex.test(origin) ||
       (isDev && localhostOriginRegex.test(origin))
     ) {
       return callback(null, true);
