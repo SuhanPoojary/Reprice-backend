@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const adminController = require("../controllers/adminController");
+const vectorController = require("../controllers/vectorController");
 const creditController = require("../controllers/creditController");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { isAdmin } = require("../middleware/adminMiddleware");
@@ -55,6 +56,33 @@ router.delete(
 
 // Orders
 router.get("/orders", authenticateToken, isAdmin, adminController.listOrders);
+
+// Vector DB (phones)
+router.get("/vector/health", authenticateToken, isAdmin, vectorController.vectorHealth);
+router.post(
+  "/vector/phones/search",
+  authenticateToken,
+  isAdmin,
+  vectorController.vectorSearchPhones
+);
+router.post(
+  "/vector/phones/upsert",
+  authenticateToken,
+  isAdmin,
+  vectorController.vectorUpsertPhone
+);
+router.post(
+  "/vector/phones/upload-csv",
+  authenticateToken,
+  isAdmin,
+  vectorController.vectorUploadPhonesCsv
+);
+router.delete(
+  "/vector/phones/:id",
+  authenticateToken,
+  isAdmin,
+  vectorController.vectorDeletePhone
+);
 
 // Customers
 router.get("/users", authenticateToken, isAdmin, adminController.listUsers);

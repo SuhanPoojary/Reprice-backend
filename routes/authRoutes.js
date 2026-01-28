@@ -8,6 +8,7 @@ const { authenticateToken } = require("../middleware/authMiddleware");
 router.post("/signup", authController.signup);
 router.post("/login", authController.login);
 router.post("/google", authController.googleAuth);
+router.post("/partner/verify-email", authController.verifyPartnerEmail);
 
 // Protected routes
 router.get("/me", authenticateToken, authController.getCurrentUser);

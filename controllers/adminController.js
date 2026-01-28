@@ -1,6 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
+const { sendEmail, partnerDecisionEmail } = require("../services/emailService");
 
 let _schemaEnsuredPromise = null;
 let _adminAuthSchemaEnsuredPromise = null;
@@ -33,6 +34,9 @@ async function ensureAdminSchema() {
       "ALTER TABLE partners ADD COLUMN IF NOT EXISTS verification_status text DEFAULT 'approved'"
     );
     await pool.query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS rejection_reason text");
+    await pool.query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verification_code_hash text");
+    await pool.query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verification_expires_at timestamptz");
+    await pool.query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verified_at timestamptz");
     await pool.query(
       "ALTER TABLE partners ADD COLUMN IF NOT EXISTS credit_balance numeric DEFAULT 0"
     );
@@ -530,7 +534,7 @@ exports.approvePartner = async (req, res) => {
           rejection_reason = NULL,
           is_active = true
       WHERE id::text = $1
-      RETURNING id
+      RETURNING id, email, name
       `,
       [partnerId]
     );
@@ -540,6 +544,21 @@ exports.approvePartner = async (req, res) => {
     }
 
     await writePartnerHistory(partnerId, "approved", approvalNotes);
+
+    // Best-effort email notification
+    try {
+      const row = result.rows[0];
+      if (row?.email) {
+        const payload = partnerDecisionEmail({
+          to: String(row.email),
+          name: String(row.name || ""),
+          approved: true,
+        });
+        await sendEmail({ to: String(row.email), ...payload });
+      }
+    } catch (e) {
+      console.error("APPROVAL EMAIL ERROR:", e);
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -566,7 +585,7 @@ exports.rejectPartner = async (req, res) => {
           rejection_reason = $2,
           is_active = false
       WHERE id::text = $1
-      RETURNING id
+      RETURNING id, email, name
       `,
       [partnerId, rejectionReason]
     );
@@ -576,6 +595,22 @@ exports.rejectPartner = async (req, res) => {
     }
 
     await writePartnerHistory(partnerId, "rejected", rejectionReason);
+
+    // Best-effort email notification
+    try {
+      const row = result.rows[0];
+      if (row?.email) {
+        const payload = partnerDecisionEmail({
+          to: String(row.email),
+          name: String(row.name || ""),
+          approved: false,
+          reason: rejectionReason,
+        });
+        await sendEmail({ to: String(row.email), ...payload });
+      }
+    } catch (e) {
+      console.error("REJECTION EMAIL ERROR:", e);
+    }
 
     res.json({ success: true });
   } catch (err) {

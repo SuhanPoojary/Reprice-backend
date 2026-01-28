@@ -2,6 +2,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const { query } = require("../db");
+const crypto = require("crypto");
+const { sendEmail, partnerVerificationEmail } = require("../services/emailService");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -21,6 +23,11 @@ async function ensurePartnerSchema() {
     await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS credit_balance numeric DEFAULT 0");
     await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS is_active boolean DEFAULT false");
     await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()");
+
+    // Email verification flow (before admin review)
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verification_code_hash text");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verification_expires_at timestamptz");
+    await query("ALTER TABLE partners ADD COLUMN IF NOT EXISTS email_verified_at timestamptz");
 
     await query(`
       CREATE TABLE IF NOT EXISTS partner_verification_history (
@@ -54,6 +61,20 @@ async function ensurePartnerSchema() {
   })();
 
   return _partnerSchemaEnsuredPromise;
+}
+
+function _generateEmailCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function _hashCode(code) {
+  return crypto.createHash("sha256").update(String(code)).digest("hex");
+}
+
+function _emailCodeExpiresAt() {
+  const mins = Number(process.env.PARTNER_EMAIL_CODE_TTL_MINUTES || 10);
+  const ms = (Number.isFinite(mins) ? mins : 10) * 60_000;
+  return new Date(Date.now() + ms);
 }
 
 // Helper function to generate JWT token
@@ -170,7 +191,7 @@ exports.signup = async (req, res) => {
               verification_status,
               is_active
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',false)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email_pending',false)
             RETURNING id, name, phone, email, company_name, business_address, gst_number, pan_number, verification_status, is_active, rejection_reason`,
             [
               name,
@@ -193,6 +214,22 @@ exports.signup = async (req, res) => {
     const user = result.rows[0];
 
     if (userType === "partner") {
+      // Email verification: generate + store code hash, then send email.
+      const code = _generateEmailCode();
+      const codeHash = _hashCode(code);
+      const expiresAt = _emailCodeExpiresAt();
+
+      await query(
+        `
+        UPDATE partners
+        SET email_verification_code_hash = $2,
+            email_verification_expires_at = $3,
+            email_verified_at = NULL
+        WHERE id::text = $1
+        `,
+        [String(user.id), codeHash, expiresAt]
+      );
+
       // Best-effort: record application submission event for admin timeline.
       try {
         const message = partnerFields?.message_from_partner || "Application submitted";
@@ -203,6 +240,23 @@ exports.signup = async (req, res) => {
         );
       } catch {
         // ignore
+      }
+
+      // Best-effort: send email (do not fail signup if SMTP isn't configured)
+      try {
+        const payload = partnerVerificationEmail({
+          to: String(email),
+          name: String(name || ""),
+          code,
+        });
+        await sendEmail({ to: String(email), ...payload });
+        await query(
+          `INSERT INTO partner_verification_history (partner_id, action_type, message_from_admin)
+           VALUES ($1, 'email_code_sent', 'Verification code sent to partner email')`,
+          [String(user.id)]
+        );
+      } catch (e) {
+        console.error("PARTNER VERIFICATION EMAIL SEND ERROR:", e);
       }
 
       // Best-effort: store a first serviceable pincode from the application.
@@ -220,14 +274,15 @@ exports.signup = async (req, res) => {
         // ignore
       }
 
-      // Partner signup is an application submission (no login until admin approves).
+      // Partner signup requires email verification before admin review.
       return res.status(201).json({
         success: true,
         message:
-          "Application submitted. Admin will review and contact you via email if approved.",
+          "Verification code sent to your email. Please verify to submit your application for admin review.",
         data: {
           application_submitted: true,
           partner_id: String(user.id),
+          email_verification_required: true,
         },
       });
     }
@@ -241,6 +296,78 @@ exports.signup = async (req, res) => {
   } catch (err) {
     console.error("Signup error:", err);
     res.status(500).json({ success: false });
+  }
+};
+
+exports.verifyPartnerEmail = async (req, res) => {
+  try {
+    await ensurePartnerSchema();
+
+    const partnerId = String(req.body?.partner_id ?? "").trim();
+    const code = String(req.body?.code ?? "").trim();
+
+    if (!partnerId || !code) {
+      return res.status(400).json({ success: false, message: "partner_id and code are required" });
+    }
+
+    const result = await query(
+      `
+      SELECT id, email_verification_code_hash, email_verification_expires_at
+      FROM partners
+      WHERE id::text = $1
+      LIMIT 1
+      `,
+      [partnerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Partner not found" });
+    }
+
+    const row = result.rows[0];
+    const hash = row.email_verification_code_hash;
+    const expiresAt = row.email_verification_expires_at ? new Date(row.email_verification_expires_at) : null;
+
+    if (!hash) {
+      return res.status(400).json({ success: false, message: "No active verification code. Please sign up again." });
+    }
+
+    if (expiresAt && Date.now() > expiresAt.getTime()) {
+      return res.status(410).json({ success: false, message: "Verification code expired. Please sign up again." });
+    }
+
+    if (_hashCode(code) !== String(hash)) {
+      return res.status(401).json({ success: false, message: "Invalid verification code" });
+    }
+
+    await query(
+      `
+      UPDATE partners
+      SET email_verified_at = now(),
+          email_verification_code_hash = NULL,
+          email_verification_expires_at = NULL,
+          verification_status = 'pending',
+          is_active = false
+      WHERE id::text = $1
+      `,
+      [partnerId]
+    );
+
+    // Best-effort timeline event
+    try {
+      await query(
+        `INSERT INTO partner_verification_history (partner_id, action_type, message_from_partner)
+         VALUES ($1, 'email_verified', 'Partner verified email')`,
+        [partnerId]
+      );
+    } catch {
+      // ignore
+    }
+
+    return res.json({ success: true, message: "Email verified. Your application is now pending admin review." });
+  } catch (err) {
+    console.error("VERIFY PARTNER EMAIL ERROR:", err);
+    return res.status(500).json({ success: false, message: "Failed to verify email" });
   }
 };
 
@@ -279,6 +406,9 @@ exports.login = async (req, res) => {
           success: false,
           code: "PARTNER_NOT_APPROVED",
           message:
+            verificationStatus === "email_pending"
+              ? "Please verify your email to submit your application."
+              :
             verificationStatus === "rejected"
               ? "Your application was rejected"
               : verificationStatus === "clarification" || verificationStatus === "clarification_needed"
