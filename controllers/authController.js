@@ -78,6 +78,25 @@ function _emailCodeExpiresAt() {
   return new Date(Date.now() + ms);
 }
 
+function _nowNs() {
+  return process.hrtime.bigint();
+}
+
+function _msSince(startNs) {
+  return Number(_nowNs() - startNs) / 1e6;
+}
+
+function _logWithReq(req, payload) {
+  const requestId = req?.requestId || req?.headers?.["x-request-id"];
+  console.log(
+    JSON.stringify({
+      level: payload?.level || "info",
+      requestId: requestId ? String(requestId) : undefined,
+      ...payload,
+    })
+  );
+}
+
 // Helper function to generate JWT token
 const generateToken = (user, userType) => {
   return jwt.sign(
@@ -162,7 +181,23 @@ function shapeUserForResponse(userType, row) {
 exports.signup = async (req, res) => {
   const { name, phone, email, password, userType } = req.body;
 
+  const requestStart = _nowNs();
+  const step = (label, extra = {}) => {
+    _logWithReq(req, {
+      msg: "signup_step",
+      label,
+      userType,
+      elapsedMs: Math.round(_msSince(requestStart)),
+      ...extra,
+    });
+  };
+
   try {
+    step("start", {
+      hasEmail: Boolean(String(email || "").trim()),
+      hasPhone: Boolean(String(phone || "").trim()),
+    });
+
     if (!name || !phone || !password || !userType) {
       return res.status(400).json({
         success: false,
@@ -185,24 +220,36 @@ exports.signup = async (req, res) => {
     }
 
     if (userType === "partner") {
+      const t = _nowNs();
       await ensurePartnerSchema();
+      step("ensurePartnerSchema_done", { tookMs: Math.round(_msSince(t)) });
     }
 
     const table = userType === "customer" ? "customers" : userType === "agent" ? "agents" : "partners";
 
-    const existingUser = await query(
-      `SELECT id FROM ${table} WHERE phone = $1`,
-      [phone]
-    );
+    {
+      const t = _nowNs();
+      const existingUser = await query(`SELECT id FROM ${table} WHERE phone = $1`, [phone]);
 
-    if (existingUser.rows.length > 0) {
-      return res.status(409).json({
-        success: false,
-        message: "User with this phone already exists",
+      step("phone_uniqueness_checked", {
+        tookMs: Math.round(_msSince(t)),
+        exists: existingUser.rows.length > 0,
       });
+
+      if (existingUser.rows.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: "User with this phone already exists",
+        });
+      }
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await (async () => {
+      const t = _nowNs();
+      const h = await bcrypt.hash(password, 10);
+      step("password_hashed", { tookMs: Math.round(_msSince(t)) });
+      return h;
+    })();
 
     const partnerFields = userType === "partner" ? getPartnerApplicationFields(req.body) : null;
 
@@ -211,7 +258,17 @@ exports.signup = async (req, res) => {
       if (!pin) {
         return res.status(400).json({ success: false, message: 'Service pincode is required' });
       }
-      const pinLookup = await lookupByPincode(pin);
+
+      const pinLookup = await (async () => {
+        const t = _nowNs();
+        const r = await lookupByPincode(pin);
+        step("pincode_lookup_done", {
+          tookMs: Math.round(_msSince(t)),
+          ok: r?.ok === true,
+          errorType: r?.errorType,
+        });
+        return r;
+      })();
       if (!pinLookup.ok) {
         return res.status(pinLookup.errorType === 'NOT_FOUND' || pinLookup.errorType === 'INVALID_PIN' ? 400 : 503).json({
           success: false,
@@ -226,9 +283,11 @@ exports.signup = async (req, res) => {
       partnerFields.pincode = pin;
     }
 
-    const result =
-      userType === "partner"
-        ? await query(
+    const result = await (async () => {
+      const t = _nowNs();
+      const r =
+        userType === "partner"
+          ? await query(
             `INSERT INTO ${table} (
               name,
               phone,
@@ -254,12 +313,15 @@ exports.signup = async (req, res) => {
               partnerFields.pan_number,
             ]
           )
-        : await query(
+          : await query(
             `INSERT INTO ${table} (name, phone, email, password_hash)
              VALUES ($1,$2,$3,$4)
              RETURNING id, name, phone, email`,
             [name, phone, email || null, passwordHash]
           );
+      step("user_inserted", { tookMs: Math.round(_msSince(t)) });
+      return r;
+    })();
 
     const user = result.rows[0];
 
@@ -269,16 +331,20 @@ exports.signup = async (req, res) => {
       const codeHash = _hashCode(code);
       const expiresAt = _emailCodeExpiresAt();
 
-      await query(
-        `
-        UPDATE partners
-        SET email_verification_code_hash = $2,
-            email_verification_expires_at = $3,
-            email_verified_at = NULL
-        WHERE id::text = $1
-        `,
-        [String(user.id), codeHash, expiresAt]
-      );
+      {
+        const t = _nowNs();
+        await query(
+          `
+          UPDATE partners
+          SET email_verification_code_hash = $2,
+              email_verification_expires_at = $3,
+              email_verified_at = NULL
+          WHERE id::text = $1
+          `,
+          [String(user.id), codeHash, expiresAt]
+        );
+        step("partner_code_saved", { tookMs: Math.round(_msSince(t)) });
+      }
       // Best-effort: store partner's service pincode for serviceability checks.
       try {
         const pin = partnerFields?.pincode ? normalizePincode(partnerFields.pincode) : "";
@@ -308,19 +374,40 @@ exports.signup = async (req, res) => {
 
       // Best-effort: send email (do not fail signup if SMTP isn't configured)
       try {
+        step("email_send_attempt", {
+          emailDisabled: String(process.env.EMAIL_DISABLED || "").trim().toLowerCase() === "true",
+          smtpHostPresent: Boolean(String(process.env.SMTP_HOST || "").trim()),
+          smtpUserPresent: Boolean(String(process.env.SMTP_USER || "").trim()),
+          smtpPassPresent: Boolean(String(process.env.SMTP_PASS || "").trim()),
+          smtpPort: process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined,
+          smtpSecure: String(process.env.SMTP_SECURE || "").trim(),
+        });
+
+        const t = _nowNs();
         const payload = partnerVerificationEmail({
           to: String(email),
           name: String(name || ""),
           code,
         });
         await sendEmail({ to: String(email), ...payload });
+        step("email_send_done", { tookMs: Math.round(_msSince(t)) });
+
+        const th = _nowNs();
         await query(
           `INSERT INTO partner_verification_history (partner_id, action_type, message_from_admin)
            VALUES ($1, 'email_code_sent', 'Verification code sent to partner email')`,
           [String(user.id)]
         );
+        step("timeline_email_code_sent_saved", { tookMs: Math.round(_msSince(th)) });
       } catch (e) {
-        console.error("PARTNER VERIFICATION EMAIL SEND ERROR:", e);
+        _logWithReq(req, {
+          level: "error",
+          msg: "partner_verification_email_send_error",
+          elapsedMs: Math.round(_msSince(requestStart)),
+          error: e?.message || String(e),
+          code: e?.code,
+          errno: e?.errno,
+        });
       }
 
       // Best-effort: store a first serviceable pincode from the application.
@@ -339,6 +426,7 @@ exports.signup = async (req, res) => {
       }
 
       // Partner signup requires email verification before admin review.
+      step("responding_partner_signup", { totalMs: Math.round(_msSince(requestStart)) });
       return res.status(201).json({
         success: true,
         message:
@@ -358,14 +446,32 @@ exports.signup = async (req, res) => {
       data: { user: shapeUserForResponse(userType, user), token },
     });
   } catch (err) {
-    console.error("Signup error:", err);
+    _logWithReq(req, {
+      level: "error",
+      msg: "signup_error",
+      elapsedMs: Math.round(_msSince(requestStart)),
+      error: err?.message || String(err),
+      stack: err?.stack,
+    });
     res.status(500).json({ success: false });
   }
 };
 
 exports.verifyPartnerEmail = async (req, res) => {
+  const requestStart = _nowNs();
+  const step = (label, extra = {}) => {
+    _logWithReq(req, {
+      msg: "verify_partner_email_step",
+      label,
+      elapsedMs: Math.round(_msSince(requestStart)),
+      ...extra,
+    });
+  };
+
   try {
+    step("start");
     await ensurePartnerSchema();
+    step("ensurePartnerSchema_done");
 
     const partnerId = String(req.body?.partner_id ?? "").trim();
     const code = String(req.body?.code ?? "").trim();
@@ -374,7 +480,9 @@ exports.verifyPartnerEmail = async (req, res) => {
       return res.status(400).json({ success: false, message: "partner_id and code are required" });
     }
 
-    const result = await query(
+    const result = await (async () => {
+      const t = _nowNs();
+      const r = await query(
       `
       SELECT id, email_verification_code_hash, email_verification_expires_at
       FROM partners
@@ -382,7 +490,10 @@ exports.verifyPartnerEmail = async (req, res) => {
       LIMIT 1
       `,
       [partnerId]
-    );
+      );
+      step("partner_loaded", { tookMs: Math.round(_msSince(t)), found: r.rows.length > 0 });
+      return r;
+    })();
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Partner not found" });
@@ -401,10 +512,13 @@ exports.verifyPartnerEmail = async (req, res) => {
     }
 
     if (_hashCode(code) !== String(hash)) {
+      step("code_invalid");
       return res.status(401).json({ success: false, message: "Invalid verification code" });
     }
 
-    await query(
+    await (async () => {
+      const t = _nowNs();
+      await query(
       `
       UPDATE partners
       SET email_verified_at = now(),
@@ -415,7 +529,9 @@ exports.verifyPartnerEmail = async (req, res) => {
       WHERE id::text = $1
       `,
       [partnerId]
-    );
+      );
+      step("partner_updated", { tookMs: Math.round(_msSince(t)) });
+    })();
 
     // Best-effort timeline event
     try {
@@ -430,7 +546,13 @@ exports.verifyPartnerEmail = async (req, res) => {
 
     return res.json({ success: true, message: "Email verified. Your application is now pending admin review." });
   } catch (err) {
-    console.error("VERIFY PARTNER EMAIL ERROR:", err);
+    _logWithReq(req, {
+      level: "error",
+      msg: "verify_partner_email_error",
+      elapsedMs: Math.round(_msSince(requestStart)),
+      error: err?.message || String(err),
+      stack: err?.stack,
+    });
     return res.status(500).json({ success: false, message: "Failed to verify email" });
   }
 };

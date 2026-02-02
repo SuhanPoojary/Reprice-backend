@@ -4,6 +4,19 @@ function _env(name, fallback = "") {
   return String(process.env[name] || fallback).trim();
 }
 
+function _boolEnv(name, fallback = false) {
+  const raw = String(process.env[name] ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "y";
+}
+
+function _numEnv(name, fallback) {
+  const raw = String(process.env[name] ?? "").trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function _isEmailLike(s) {
   return typeof s === "string" && s.includes("@");
 }
@@ -27,6 +40,27 @@ function _getTransport() {
   const port = Number(_env("SMTP_PORT", "587"));
   const secure = String(_env("SMTP_SECURE", "")).toLowerCase() === "true" || port === 465;
 
+  // Important: without timeouts, some hosts will hang for a long time if SMTP is blocked.
+  const connectionTimeout = _numEnv("SMTP_CONNECTION_TIMEOUT_MS", 10_000);
+  const greetingTimeout = _numEnv("SMTP_GREETING_TIMEOUT_MS", 10_000);
+  const socketTimeout = _numEnv("SMTP_SOCKET_TIMEOUT_MS", 20_000);
+
+  const debug = _boolEnv("EMAIL_DEBUG", false);
+  if (debug) {
+    console.log(
+      JSON.stringify({
+        level: "info",
+        msg: "email_transport_config",
+        host,
+        port,
+        secure,
+        connectionTimeout,
+        greetingTimeout,
+        socketTimeout,
+      })
+    );
+  }
+
   return nodemailer.createTransport({
     host,
     port,
@@ -35,12 +69,34 @@ function _getTransport() {
       user: _env("SMTP_USER"),
       pass: _env("SMTP_PASS"),
     },
+    connectionTimeout,
+    greetingTimeout,
+    socketTimeout,
+    logger: debug,
+    debug,
   });
 }
 
 async function sendEmail({ to, subject, text, html }) {
+  const debug = _boolEnv("EMAIL_DEBUG", false);
+  const disabled = _boolEnv("EMAIL_DISABLED", false);
+
   if (!_isEmailLike(to)) {
     return { ok: false, skipped: true, reason: "invalid_to" };
+  }
+
+  if (disabled) {
+    if (debug) {
+      console.log(
+        JSON.stringify({
+          level: "warn",
+          msg: "email_skipped_disabled",
+          to,
+          subject,
+        })
+      );
+    }
+    return { ok: true, skipped: true, reason: "email_disabled" };
   }
 
   const from = _getFrom();
@@ -56,13 +112,52 @@ async function sendEmail({ to, subject, text, html }) {
     return { ok: true, skipped: true, reason: "smtp_not_configured" };
   }
 
-  await transporter.sendMail({
-    from,
-    to,
-    subject,
-    text,
-    html,
-  });
+  try {
+    if (debug) {
+      console.log(
+        JSON.stringify({
+          level: "info",
+          msg: "email_send_attempt",
+          to,
+          subject,
+          hasText: Boolean(text),
+          hasHtml: Boolean(html),
+        })
+      );
+    }
+
+    await transporter.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      html,
+    });
+
+    if (debug) {
+      console.log(
+        JSON.stringify({
+          level: "info",
+          msg: "email_send_success",
+          to,
+          subject,
+        })
+      );
+    }
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        msg: "email_send_error",
+        to,
+        subject,
+        error: e?.message || String(e),
+        code: e?.code,
+        errno: e?.errno,
+      })
+    );
+    throw e;
+  }
 
   return { ok: true };
 }

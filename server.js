@@ -6,8 +6,12 @@ require("dotenv").config();
 
 const routes = require("./routes");
 const { testConnection } = require("./db");
+const { requestLogger } = require("./middleware/requestLogger");
 
 const app = express();
+
+// Request id + duration logging (enable via env flags)
+app.use(requestLogger);
 
 /* =========================
    ✅ FIX 1: PORT
