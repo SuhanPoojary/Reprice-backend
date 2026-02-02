@@ -8,7 +8,7 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false
   },
-  // Connection pool settings
+  // Boom bbambdmnv
   max: 20, // Maximum number of connections in the pool
   idleTimeoutMillis: 30000, // Close idle connections after 30 seconds
   connectionTimeoutMillis: 10000, // Return an error after 2 seconds if connection not available
