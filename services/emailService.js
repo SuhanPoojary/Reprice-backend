@@ -27,10 +27,18 @@ function _getTransport() {
   const port = Number(_env("SMTP_PORT", "587"));
   const secure = String(_env("SMTP_SECURE", "")).toLowerCase() === "true" || port === 465;
 
+  // Prevent long hangs when SMTP is slow/unreachable.
+  const connectionTimeout = Number(_env("SMTP_CONNECTION_TIMEOUT_MS", "7000"));
+  const greetingTimeout = Number(_env("SMTP_GREETING_TIMEOUT_MS", "7000"));
+  const socketTimeout = Number(_env("SMTP_SOCKET_TIMEOUT_MS", "10000"));
+
   return nodemailer.createTransport({
     host,
     port,
     secure,
+    connectionTimeout: Number.isFinite(connectionTimeout) ? connectionTimeout : 7000,
+    greetingTimeout: Number.isFinite(greetingTimeout) ? greetingTimeout : 7000,
+    socketTimeout: Number.isFinite(socketTimeout) ? socketTimeout : 10000,
     auth: {
       user: _env("SMTP_USER"),
       pass: _env("SMTP_PASS"),

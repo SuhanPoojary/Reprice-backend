@@ -313,14 +313,20 @@ exports.signup = async (req, res) => {
           name: String(name || ""),
           code,
         });
-        await sendEmail({ to: String(email), ...payload });
-        await query(
-          `INSERT INTO partner_verification_history (partner_id, action_type, message_from_admin)
-           VALUES ($1, 'email_code_sent', 'Verification code sent to partner email')`,
-          [String(user.id)]
-        );
+
+        // Fire-and-forget to keep signup fast even if SMTP is slow/unreachable.
+        void (async () => {
+          await sendEmail({ to: String(email), ...payload });
+          await query(
+            `INSERT INTO partner_verification_history (partner_id, action_type, message_from_admin)
+             VALUES ($1, 'email_code_sent', 'Verification code sent to partner email')`,
+            [String(user.id)]
+          );
+        })().catch((e) => {
+          console.error("PARTNER VERIFICATION EMAIL SEND ERROR:", e);
+        });
       } catch (e) {
-        console.error("PARTNER VERIFICATION EMAIL SEND ERROR:", e);
+        console.error("PARTNER VERIFICATION EMAIL SETUP ERROR:", e);
       }
 
       // Best-effort: store a first serviceable pincode from the application.

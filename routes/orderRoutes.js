@@ -677,8 +677,17 @@ router.get("/my", authenticateToken, async (req, res) => {
 });
 
 // GET SINGLE ORDER DETAILS — MUST BE LAST
-router.get("/:id", authenticateToken, async (req, res) => {
-  try {
+router.get(
+  "/:id",
+  (req, res, next) => {
+    // Defensive: if route ordering is wrong in a deployed build, "/serviceability" can get swallowed by "/:id".
+    // In that case, skip this route and let the public "/serviceability" handler respond.
+    const id = String(req.params.id || "").toLowerCase();
+    if (id === "serviceability") return next("route");
+    return authenticateToken(req, res, next);
+  },
+  async (req, res) => {
+    try {
     const orderId = req.params.id;
     const userId = req.user.id;
     const userType = req.user.userType;
@@ -741,13 +750,14 @@ router.get("/:id", authenticateToken, async (req, res) => {
       success: true,
       order: result.rows[0],
     });
-  } catch (err) {
-    console.error("GET ORDER ERROR:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch order",
-    });
+    } catch (err) {
+      console.error("GET ORDER ERROR:", err);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch order",
+      });
+    }
   }
-});
+);
 
 module.exports = router;
