@@ -211,6 +211,18 @@ async function isAnyPartnerServingPincode(pincode) {
   return result.rows.length > 0;
 }
 
+function pickStreetForGeocoding(fullAddress) {
+  const parts = String(fullAddress || "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Checkout composes address as: house, street, landmark.
+  // We geocode only the street (plus city/state/pincode) for higher match rate.
+  if (parts.length >= 2) return parts[1];
+  return parts[0] || "";
+}
+
 // Check whether a customer-entered pincode is valid and serviceable.
 // This avoids creating an order just to surface the "not serviceable" message.
 router.get("/serviceability", async (req, res) => {
@@ -369,26 +381,41 @@ router.post("/create", authenticateToken, async (req, res) => {
       clientLongitude: longitude ?? null,
     });
 
+    const streetForGeocode = pickStreetForGeocoding(address);
+    geoLog("geocode_input", {
+      street: String(streetForGeocode || "").slice(0, 200),
+    });
+
     const geo = await geocodeAddress({
-      address,
+      address: streetForGeocode,
       city: city || pinLookup.district || '',
       state: state || pinLookup.state || '',
       pincode: normalizedPincode,
       country: 'India',
     });
 
-    const resolvedLat = geo.ok ? geo.lat : latitude ?? null;
-    const resolvedLon = geo.ok ? geo.lon : longitude ?? null;
+    // Prefer live GPS coordinates if provided by the client.
+    // Still run geocoding for address fields (fallback + debugging visibility).
+    const clientLat = Number(latitude);
+    const clientLon = Number(longitude);
+    const hasClientCoords = Number.isFinite(clientLat) && Number.isFinite(clientLon);
+
+    const geocodedLat = geo.ok ? Number(geo.lat) : NaN;
+    const geocodedLon = geo.ok ? Number(geo.lon) : NaN;
+    const hasGeocodedCoords = Number.isFinite(geocodedLat) && Number.isFinite(geocodedLon);
+
+    const resolvedLat = hasClientCoords ? clientLat : (hasGeocodedCoords ? geocodedLat : null);
+    const resolvedLon = hasClientCoords ? clientLon : (hasGeocodedCoords ? geocodedLon : null);
 
     geoLog("result", {
       ok: geo.ok,
       errorType: geo.ok ? null : geo.errorType,
       message: geo.ok ? null : geo.message,
-      geocodedLat: geo.ok ? geo.lat : null,
-      geocodedLon: geo.ok ? geo.lon : null,
+      geocodedLat: hasGeocodedCoords ? geocodedLat : null,
+      geocodedLon: hasGeocodedCoords ? geocodedLon : null,
       resolvedLat,
       resolvedLon,
-      source: geo.ok ? "geocode.maps.co" : (latitude != null && longitude != null ? "client_fallback" : "null"),
+      source: hasClientCoords ? "client_gps" : (hasGeocodedCoords ? "geocode.maps.co" : "null"),
     });
 
     const customerId = req.user.id;
