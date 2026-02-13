@@ -15,7 +15,17 @@ const { geocodeAddress } = require("../services/geocodeMapsCoService");
 
 const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
+let _partnerPinsSchemaEnsured = false;
+let _partnerPinsSchemaEnsuring = null;
+
 async function ensurePartnerServiceablePincodesSchema() {
+  if (_partnerPinsSchemaEnsured) return;
+  if (_partnerPinsSchemaEnsuring) {
+    await _partnerPinsSchemaEnsuring;
+    return;
+  }
+
+  _partnerPinsSchemaEnsuring = (async () => {
   await pool.query(
     `
     CREATE TABLE IF NOT EXISTS partner_serviceable_pincodes (
@@ -36,6 +46,15 @@ async function ensurePartnerServiceablePincodesSchema() {
   await pool.query(
     "CREATE INDEX IF NOT EXISTS idx_partner_serviceable_pincodes_pincode_active ON partner_serviceable_pincodes (pincode, is_active)"
   );
+
+  _partnerPinsSchemaEnsured = true;
+  })();
+
+  try {
+    await _partnerPinsSchemaEnsuring;
+  } finally {
+    _partnerPinsSchemaEnsuring = null;
+  }
 }
 
 async function hasApprovedPartnerForPincode(pincode) {
@@ -66,6 +85,29 @@ async function hasApprovedPartnerForPincode(pincode) {
 
   const svc = await isServiceableForPartnerPins(pin, partnerPins, SERVICE_RADIUS_KM);
   return svc.ok ? svc.serviceable : false;
+}
+
+async function getApprovedPartnerPins() {
+  await ensurePartnerServiceablePincodesSchema();
+
+  const hasIsActive = await hasColumn("partners", "is_active");
+  const hasVerification = await hasColumn("partners", "verification_status");
+
+  const partnerFilters = ["1=1"];
+  if (hasIsActive) partnerFilters.push("p.is_active = true");
+  if (hasVerification) partnerFilters.push("LOWER(COALESCE(p.verification_status,'')) = 'approved'");
+
+  const result = await pool.query(
+    `
+    SELECT DISTINCT regexp_replace(sp.pincode, '\\D', '', 'g') AS pincode
+    FROM partner_serviceable_pincodes sp
+    JOIN partners p ON p.id::text = sp.partner_id
+    WHERE sp.is_active = true
+      AND ${partnerFilters.join(" AND ")}
+    `
+  );
+
+  return result.rows.map((r) => r.pincode).filter(Boolean);
 }
 
 const _schemaCache = new Map();
@@ -169,6 +211,72 @@ async function isAnyPartnerServingPincode(pincode) {
   return result.rows.length > 0;
 }
 
+// Check whether a customer-entered pincode is valid and serviceable.
+// This avoids creating an order just to surface the "not serviceable" message.
+router.get("/serviceability", async (req, res) => {
+  try {
+    const pincode = req.query?.pincode;
+
+    const normalizedPincode = normalizePincode(pincode);
+    if (!isValidIndianPincode(normalizedPincode)) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_PINCODE",
+        message: "Please enter a valid 6-digit pincode.",
+      });
+    }
+
+    const pinLookup = await lookupByPincode(normalizedPincode);
+    if (!pinLookup.ok) {
+      return res
+        .status(pinLookup.errorType === "NOT_FOUND" || pinLookup.errorType === "INVALID_PIN" ? 400 : 503)
+        .json({
+          success: false,
+          code: "INVALID_PINCODE",
+          message:
+            pinLookup.errorType === "NOT_FOUND"
+              ? "Please enter a valid 6-digit pincode."
+              : pinLookup.message || "PIN Code validation service is unavailable. Please try again.",
+        });
+    }
+
+    const partnerPins = await getApprovedPartnerPins();
+    const svc = await isServiceableForPartnerPins(normalizedPincode, partnerPins, SERVICE_RADIUS_KM);
+    if (!svc.ok) {
+      return res.status(503).json({
+        success: false,
+        code: "SERVICEABILITY_UNAVAILABLE",
+        message: "Serviceability check is temporarily unavailable. Please try again.",
+      });
+    }
+
+    if (!svc.serviceable) {
+      return res.status(422).json({
+        success: false,
+        code: "NOT_SERVICEABLE",
+        message: "Order not serviceable. Change your pincode.",
+        serviceable: false,
+        reason: svc.reason,
+      });
+    }
+
+    return res.json({
+      success: true,
+      serviceable: true,
+      pincode: normalizedPincode,
+      district: pinLookup.district,
+      state: pinLookup.state,
+    });
+  } catch (err) {
+    console.error("Serviceability check error:", err);
+    return res.status(503).json({
+      success: false,
+      code: "SERVICEABILITY_UNAVAILABLE",
+      message: "Serviceability check is temporarily unavailable. Please try again.",
+    });
+  }
+});
+
 router.post("/create", authenticateToken, async (req, res) => {
   try {
     const {
@@ -209,12 +317,21 @@ router.post("/create", authenticateToken, async (req, res) => {
         });
     }
 
-    const serviceableByPin = await hasApprovedPartnerForPincode(normalizedPincode);
-    if (!serviceableByPin) {
+    const partnerPins = await getApprovedPartnerPins();
+    const svc = await isServiceableForPartnerPins(normalizedPincode, partnerPins, SERVICE_RADIUS_KM);
+    if (!svc.ok) {
+      return res.status(503).json({
+        success: false,
+        code: "SERVICEABILITY_UNAVAILABLE",
+        message: "Serviceability check is temporarily unavailable. Please try again.",
+      });
+    }
+
+    if (!svc.serviceable) {
       return res.status(422).json({
         success: false,
         code: "NOT_SERVICEABLE",
-        message: "Order not servicable in your region. pls change ur pincode",
+        message: "Order not serviceable. Change your pincode.",
       });
     }
 
@@ -621,8 +738,17 @@ router.get("/my", authenticateToken, async (req, res) => {
 });
 
 // GET SINGLE ORDER DETAILS — MUST BE LAST
-router.get("/:id", authenticateToken, async (req, res) => {
-  try {
+router.get(
+  "/:id",
+  (req, res, next) => {
+    // Defensive: if route ordering is wrong in a deployed build, "/serviceability" can get swallowed by "/:id".
+    // In that case, skip this route and let the public "/serviceability" handler respond.
+    const id = String(req.params.id || "").toLowerCase();
+    if (id === "serviceability") return next("route");
+    return authenticateToken(req, res, next);
+  },
+  async (req, res) => {
+    try {
     const orderId = req.params.id;
     const userId = req.user.id;
     const userType = req.user.userType;
@@ -685,13 +811,14 @@ router.get("/:id", authenticateToken, async (req, res) => {
       success: true,
       order: result.rows[0],
     });
-  } catch (err) {
-    console.error("GET ORDER ERROR:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch order",
-    });
+    } catch (err) {
+      console.error("GET ORDER ERROR:", err);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch order",
+      });
+    }
   }
-});
+);
 
 module.exports = router;

@@ -65,6 +65,9 @@ function _getTransport() {
     host,
     port,
     secure,
+    connectionTimeout: Number.isFinite(connectionTimeout) ? connectionTimeout : 7000,
+    greetingTimeout: Number.isFinite(greetingTimeout) ? greetingTimeout : 7000,
+    socketTimeout: Number.isFinite(socketTimeout) ? socketTimeout : 10000,
     auth: {
       user: _env("SMTP_USER"),
       pass: _env("SMTP_PASS"),
