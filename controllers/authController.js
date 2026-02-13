@@ -345,6 +345,16 @@ exports.signup = async (req, res) => {
         );
         step("partner_code_saved", { tookMs: Math.round(_msSince(t)) });
       }
+
+      // TEMPORARY: log OTP to server logs (Render console) so you can manually verify during testing.
+      // SECURITY WARNING: remove this once email delivery is fixed.
+      _logWithReq(req, {
+        level: "warn",
+        msg: "partner_verification_code_generated",
+        partnerId: String(user.id),
+        code,
+        expiresAt: expiresAt?.toISOString?.() || String(expiresAt),
+      });
       // Best-effort: store partner's service pincode for serviceability checks.
       try {
         const pin = partnerFields?.pincode ? normalizePincode(partnerFields.pincode) : "";
@@ -372,43 +382,8 @@ exports.signup = async (req, res) => {
         // ignore
       }
 
-      // Best-effort: send email (do not fail signup if SMTP isn't configured)
-      try {
-        step("email_send_attempt", {
-          emailDisabled: String(process.env.EMAIL_DISABLED || "").trim().toLowerCase() === "true",
-          smtpHostPresent: Boolean(String(process.env.SMTP_HOST || "").trim()),
-          smtpUserPresent: Boolean(String(process.env.SMTP_USER || "").trim()),
-          smtpPassPresent: Boolean(String(process.env.SMTP_PASS || "").trim()),
-          smtpPort: process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined,
-          smtpSecure: String(process.env.SMTP_SECURE || "").trim(),
-        });
-
-        const t = _nowNs();
-        const payload = partnerVerificationEmail({
-          to: String(email),
-          name: String(name || ""),
-          code,
-        });
-        await sendEmail({ to: String(email), ...payload });
-        step("email_send_done", { tookMs: Math.round(_msSince(t)) });
-
-        const th = _nowNs();
-        await query(
-          `INSERT INTO partner_verification_history (partner_id, action_type, message_from_admin)
-           VALUES ($1, 'email_code_sent', 'Verification code sent to partner email')`,
-          [String(user.id)]
-        );
-        step("timeline_email_code_sent_saved", { tookMs: Math.round(_msSince(th)) });
-      } catch (e) {
-        _logWithReq(req, {
-          level: "error",
-          msg: "partner_verification_email_send_error",
-          elapsedMs: Math.round(_msSince(requestStart)),
-          error: e?.message || String(e),
-          code: e?.code,
-          errno: e?.errno,
-        });
-      }
+      // Email sending is intentionally skipped for now.
+      const shouldExposeCode = true;
 
       // Best-effort: store a first serviceable pincode from the application.
       try {
@@ -430,11 +405,12 @@ exports.signup = async (req, res) => {
       return res.status(201).json({
         success: true,
         message:
-          "Verification code sent to your email. Please verify to submit your application for admin review.",
+          "Verification code generated. Please enter the code to verify your email and submit your application for admin review.",
         data: {
           application_submitted: true,
           partner_id: String(user.id),
           email_verification_required: true,
+          verification_code: code,
         },
       });
     }

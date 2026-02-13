@@ -11,6 +11,7 @@ const {
   isValidIndianPincode,
 } = require("../services/indiaPostService");
 const { isServiceableForPartnerPins } = require("../services/pincodeRadiusService");
+const { geocodeAddress } = require("../services/geocodeMapsCoService");
 
 const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
@@ -219,6 +220,60 @@ router.post("/create", authenticateToken, async (req, res) => {
 
     // Location is optional; serviceability is determined by PIN.
 
+    // Server-side geocoding: convert the entered address into coordinates.
+    // We still accept client-provided latitude/longitude as a fallback.
+    const geoLogEnabled =
+      String(process.env.LOG_GEOCODE || "").trim().toLowerCase() === "true" ||
+      String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+
+    const geoLog = (event, data) => {
+      if (!geoLogEnabled) return;
+      try {
+        console.log(
+          JSON.stringify({
+            level: "info",
+            msg: "order_geocode",
+            event,
+            ...data,
+          })
+        );
+      } catch {
+        // ignore logging failures
+      }
+    };
+
+    geoLog("start", {
+      customerId: req.user?.id,
+      address: String(address || "").slice(0, 200),
+      city: city || pinLookup.district || "",
+      state: state || pinLookup.state || "",
+      pincode: normalizedPincode,
+      clientLatitude: latitude ?? null,
+      clientLongitude: longitude ?? null,
+    });
+
+    const geo = await geocodeAddress({
+      address,
+      city: city || pinLookup.district || '',
+      state: state || pinLookup.state || '',
+      pincode: normalizedPincode,
+      country: 'India',
+    });
+
+    const resolvedLat = geo.ok ? geo.lat : latitude ?? null;
+    const resolvedLon = geo.ok ? geo.lon : longitude ?? null;
+
+    geoLog("result", {
+      ok: geo.ok,
+      errorType: geo.ok ? null : geo.errorType,
+      message: geo.ok ? null : geo.message,
+      geocodedLat: geo.ok ? geo.lat : null,
+      geocodedLon: geo.ok ? geo.lon : null,
+      resolvedLat,
+      resolvedLon,
+      source: geo.ok ? "geocode.maps.co" : (latitude != null && longitude != null ? "client_fallback" : "null"),
+    });
+
     const customerId = req.user.id;
 
     const addressResult = await pool.query(
@@ -232,12 +287,18 @@ router.post("/create", authenticateToken, async (req, res) => {
         city || pinLookup.district || '',
         state || pinLookup.state || "",
         normalizedPincode,
-        latitude ?? null,
-        longitude ?? null,
+        resolvedLat,
+        resolvedLon,
       ]
     );
 
     const addressId = addressResult.rows[0].id;
+
+    geoLog("stored", {
+      addressId,
+      storedLatitude: resolvedLat,
+      storedLongitude: resolvedLon,
+    });
 
     const orderNumber = `MOB${Date.now()}${Math.floor(Math.random() * 1000)}`;
 
