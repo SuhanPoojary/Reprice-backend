@@ -11,7 +11,7 @@ const {
   isValidIndianPincode,
 } = require("../services/indiaPostService");
 const { isServiceableForPartnerPins } = require("../services/pincodeRadiusService");
-const { geocodeAddress } = require("../services/geocodeMapsCoService");
+const { geocodeAddress, reverseGeocode } = require("../services/geocodeMapsCoService");
 
 const SERVICE_RADIUS_KM = Number(process.env.SERVICE_RADIUS_KM || 20);
 
@@ -285,6 +285,50 @@ router.get("/serviceability", async (req, res) => {
       success: false,
       code: "SERVICEABILITY_UNAVAILABLE",
       message: "Serviceability check is temporarily unavailable. Please try again.",
+    });
+  }
+});
+
+// Reverse geocode: turn live GPS coordinates into address parts for the checkout form.
+// Authenticated to reduce abuse and avoid exposing the geocoding API key client-side.
+router.get("/reverse-geocode", authenticateToken, async (req, res) => {
+  try {
+    const lat = Number(req.query?.lat);
+    const lon = Number(req.query?.lon);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_COORDS",
+        message: "Please provide valid latitude/longitude.",
+      });
+    }
+
+    const result = await reverseGeocode({ lat, lon });
+    if (!result.ok) {
+      return res.status(result.errorType === "NOT_FOUND" ? 404 : 503).json({
+        success: false,
+        code: result.errorType,
+        message: result.message || "Could not reverse geocode coordinates.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      address: {
+        street: result.street || "",
+        city: result.city || "",
+        state: result.state || "",
+        pincode: result.pincode || "",
+        displayName: result.displayName || "",
+      },
+    });
+  } catch (err) {
+    console.error("Reverse geocode error:", err);
+    return res.status(503).json({
+      success: false,
+      code: "SERVICEABILITY_UNAVAILABLE",
+      message: "Reverse geocoding is temporarily unavailable. Please try again.",
     });
   }
 });

@@ -137,6 +137,83 @@ async function geocodeAddress({ address, city, state, pincode, country = 'India'
   }
 }
 
+function pickFirstString(...values) {
+  for (const v of values) {
+    const s = String(v || '').trim();
+    if (s) return s;
+  }
+  return '';
+}
+
+/**
+ * Reverse geocode (coordinates -> address parts) using https://geocode.maps.co/reverse
+ *
+ * Returns: { ok:true, street, city, state, pincode, displayName, raw } | { ok:false, errorType, message, details? }
+ */
+async function reverseGeocode({ lat, lon }) {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    return {
+      ok: false,
+      errorType: 'MISSING_API_KEY',
+      message: 'Geocoding API key is not configured',
+    };
+  }
+
+  const nLat = Number(lat);
+  const nLon = Number(lon);
+  if (!Number.isFinite(nLat) || !Number.isFinite(nLon)) {
+    return { ok: false, errorType: 'INVALID_COORDS', message: 'Coordinates are invalid' };
+  }
+
+  try {
+    const url = `https://geocode.maps.co/reverse?lat=${encodeURIComponent(String(nLat))}&lon=${encodeURIComponent(String(nLon))}&api_key=${encodeURIComponent(apiKey)}`;
+    const payload = await fetchJson(url);
+
+    const addr = payload?.address || {};
+    const displayName = String(payload?.display_name || '').trim();
+
+    const road = pickFirstString(addr.road, addr.pedestrian, addr.footway, addr.path);
+    const neighborhood = pickFirstString(addr.neighbourhood, addr.neighborhood, addr.suburb, addr.quarter, addr.hamlet);
+    const street = [road, neighborhood].map((x) => String(x || '').trim()).filter(Boolean).join(', ');
+
+    const city = pickFirstString(addr.city, addr.town, addr.village, addr.county, addr.municipality, addr.state_district);
+    const state = pickFirstString(addr.state, addr.region);
+    const pincode = pickFirstString(addr.postcode);
+
+    if (!street && !city && !state && !pincode && !displayName) {
+      return { ok: false, errorType: 'NOT_FOUND', message: 'No address found for coordinates' };
+    }
+
+    return {
+      ok: true,
+      street,
+      city,
+      state,
+      pincode,
+      displayName,
+      raw: payload,
+    };
+  } catch (err) {
+    const code = String(err?.code || '');
+    return {
+      ok: false,
+      errorType:
+        code === 'GEOCODE_RATE_LIMIT'
+          ? 'RATE_LIMIT'
+          : code === 'GEOCODE_TIMEOUT'
+            ? 'TIMEOUT'
+            : 'NETWORK',
+      message:
+        code === 'GEOCODE_RATE_LIMIT'
+          ? 'Geocoding rate limit exceeded. Please try again shortly.'
+          : 'Geocoding service is unavailable. Please try again.',
+      details: String(err?.message ?? err),
+    };
+  }
+}
+
 module.exports = {
   geocodeAddress,
+  reverseGeocode,
 };
